@@ -5,6 +5,7 @@ import requests
 import datetime
 import pytz
 import logging
+from urllib.request import Request, urlopen
 
 # === CONFIG ===
 EMA_FAST = 13
@@ -17,27 +18,47 @@ DISCORD_WEBHOOK = "PASTE_YOUR_DISCORD_WEBHOOK_HERE"
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(message)s")
 
 
-# === FETCH SYMBOL LISTS ===
-def get_sp500_tickers():
-    """Scrape S&P 500 tickers from Wikipedia."""
+# === HELPERS ===
+def safe_html_read(url):
+    """Load HTML with custom headers to avoid 403 errors."""
     try:
-        table = pd.read_html("https://en.wikipedia.org/wiki/List_of_S%26P_500_companies")
-        df = table[0]
-        tickers = df["Symbol"].tolist()
-        logging.info("Loaded %d S&P 500 tickers.", len(tickers))
-        return tickers
+        req = Request(url, headers={'User-Agent': 'Mozilla/5.0'})
+        with urlopen(req) as r:
+            return pd.read_html(r.read())
+    except Exception as e:
+        logging.error("Error fetching %s: %s", url, e)
+        return None
+
+
+def get_sp500_tickers():
+    """Scrape S&P 500 tickers from Wikipedia or fallback to GitHub list."""
+    try:
+        table = safe_html_read("https://en.wikipedia.org/wiki/List_of_S%26P_500_companies")
+        if table and len(table) > 0:
+            df = table[0]
+            tickers = df["Symbol"].tolist()
+            logging.info("Loaded %d S&P 500 tickers.", len(tickers))
+            return tickers
     except Exception as e:
         logging.error("Error loading S&P 500 list: %s", e)
-        # fallback minimal list
+
+    # Fallback: GitHub static CSV of S&P 500 symbols
+    try:
+        df = pd.read_csv("https://raw.githubusercontent.com/datasets/s-and-p-500-companies/main/data/constituents.csv")
+        return df["Symbol"].tolist()
+    except Exception as e:
+        logging.error("Fallback S&P list failed: %s", e)
         return ["AAPL", "MSFT", "TSLA", "NVDA", "AMZN", "META", "GOOG"]
 
 
 def get_biotech_tickers():
-    """Fetch or define top 100 biotech tickers."""
+    """Fetch or define top biotech tickers."""
     try:
-        # Example source (NASDAQ Biotech Index)
-        table = pd.read_html("https://en.wikipedia.org/wiki/NASDAQ_Biotechnology_Index")
-        df = table[1] if len(table) > 1 else table[0]
+        table = safe_html_read("https://en.wikipedia.org/wiki/NASDAQ_Biotechnology_Index")
+        if table and len(table) > 1:
+            df = table[1]
+        else:
+            df = table[0]
         tickers = df["Ticker"].dropna().tolist()
         logging.info("Loaded %d biotech tickers.", len(tickers))
         return tickers
@@ -51,11 +72,9 @@ def get_biotech_tickers():
         ]
 
 
-# === COMBINE SYMBOL LISTS ===
 def build_symbol_list():
     sp500 = get_sp500_tickers()
     biotech = get_biotech_tickers()
-    # combine and remove duplicates
     all_syms = sorted(set(sp500 + biotech))
     logging.info("Total tickers to scan: %d", len(all_syms))
     return all_syms
@@ -64,7 +83,7 @@ def build_symbol_list():
 SYMBOLS = build_symbol_list()
 
 
-# === DISCORD NOTIFICATION ===
+# === NOTIFICATIONS ===
 def send_alert(msg: str):
     if DISCORD_WEBHOOK and DISCORD_WEBHOOK != "PASTE_YOUR_DISCORD_WEBHOOK_HERE":
         try:
@@ -76,7 +95,7 @@ def send_alert(msg: str):
         logging.warning("⚠️ No webhook URL configured — alert not sent.")
 
 
-# === CORE SCANNER ===
+# === SCANNER CORE ===
 def scan_once():
     tz = pytz.timezone(TIMEZONE)
     now = datetime.datetime.now(tz).strftime("%Y-%m-%d %H:%M")
@@ -89,34 +108,5 @@ def scan_once():
             if len(df) < 2:
                 continue
 
-            df["ema_fast"] = df["Close"].ewm(span=EMA_FAST).mean()
-            df["ema_slow"] = df["Close"].ewm(span=EMA_SLOW).mean()
-
-            prev_fast, prev_slow = df["ema_fast"].iloc[-2], df["ema_slow"].iloc[-2]
-            last_fast, last_slow = df["ema_fast"].iloc[-1], df["ema_slow"].iloc[-1]
-
-            cross_up = prev_fast < prev_slow and last_fast > last_slow
-            cross_dn = prev_fast > prev_slow and last_fast < last_slow
-
-            if cross_up:
-                signals.append(f"📈 {sym} BUY @ {df['Close'].iloc[-1]:.2f}")
-            elif cross_dn:
-                signals.append(f"🔻 {sym} SELL @ {df['Close'].iloc[-1]:.2f}")
-
-        except Exception as e:
-            logging.error("Error scanning %s: %s", sym, e)
-
-    if signals:
-        msg = f"**EMA Cross Alerts — {now}**\n" + "\n".join(signals)
-        send_alert(msg)
-    else:
-        logging.info("%s — No signals", now)
-
-
-# === MAIN LOOP ===
-if __name__ == "__main__":
-    logging.info("🚀 EMA Scanner Bot Started — scanning every %d seconds", CHECK_INTERVAL)
-    while True:
-        scan_once()
-        time.sleep(CHECK_INTERVAL)
+            df["ema_fast"] = df["C]()_]()
 

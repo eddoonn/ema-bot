@@ -146,9 +146,12 @@ def scan_once():
             df["ema_slow"] = df["Close"].ewm(span=EMA_SLOW).mean()
 
             # Use scalar comparisons (avoid Series ambiguity)
-            prev_fast, prev_slow = float(df["ema_fast"].iloc[-2]), float(df["ema_slow"].iloc[-2])
-            last_fast, last_slow = float(df["ema_fast"].iloc[-1]), float(df["ema_slow"].iloc[-1])
-            last_close = float(df["Close"].iloc[-1])
+            prev_fast = float(df["ema_fast"].iat[-2])
+            prev_slow = float(df["ema_slow"].iat[-2])
+            last_fast = float(df["ema_fast"].iat[-1])
+            last_slow = float(df["ema_slow"].iat[-1])
+            last_close = float(df["Close"].iat[-1])
+
 
             cross_up = (prev_fast < prev_slow) and (last_fast > last_slow)
             cross_dn = (prev_fast > prev_slow) and (last_fast < last_slow)

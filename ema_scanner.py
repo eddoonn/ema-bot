@@ -142,12 +142,14 @@ def scan_once():
             df["ema_slow"] = df["Close"].ewm(span=EMA_SLOW).mean()
 
 
-            # === Extract scalar values safely (NumPy 1.25+ proof) ===
-            prev_fast = float(df["ema_fast"].iloc[-2])
-            prev_slow = float(df["ema_slow"].iloc[-2])
-            last_fast = float(df["ema_fast"].iloc[-1])
-            last_slow = float(df["ema_slow"].iloc[-1])
-            last_close = float(df["Close"].iloc[-1])
+
+            # === Extract true scalars safely (handles Series edge cases) ===
+            prev_fast = float(df["ema_fast"].iloc[-2:].iloc[0])
+            prev_slow = float(df["ema_slow"].iloc[-2:].iloc[0])
+            last_fast = float(df["ema_fast"].iloc[-1:].iloc[0])
+            last_slow = float(df["ema_slow"].iloc[-1:].iloc[0])
+            last_close = float(df["Close"].iloc[-1:].iloc[0])
+
 
 
             # === Validate and check signals ===

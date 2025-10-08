@@ -6,6 +6,8 @@ import datetime
 import pytz
 import logging
 from urllib.request import Request, urlopen
+from io import StringIO
+import warnings
 
 # === CONFIGURATION ===
 EMA_FAST = 13
@@ -17,26 +19,29 @@ TIMEZONE = "America/New_York"
 DISCORD_WEBHOOK = "PASTE_YOUR_DISCORD_WEBHOOK_HERE"
 TEST_ALERT_ON_START = False
 
+# optional: silence irrelevant deprecation chatter
+warnings.filterwarnings("ignore", category=DeprecationWarning)
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s - %(message)s",
 )
 
-# === HELPER FUNCTIONS ===
+# === HELPERS ===
 def safe_html_read(url: str):
-    """Fetch an HTML page using a browser-like header to avoid 403s."""
+    """Fetch an HTML page with browser headers, return list of tables."""
     try:
         req = Request(url, headers={"User-Agent": "Mozilla/5.0"})
         with urlopen(req) as r:
             html = r.read().decode("utf-8", errors="ignore")
-        return pd.read_html(html)
+        return pd.read_html(StringIO(html))  # <- modern safe usage
     except Exception as e:
         logging.error("Error fetching %s: %s", url, e)
         return None
 
 
 def _normalize_for_yahoo(tickers):
-    """Fix symbols for Yahoo Finance format (e.g. BRK.B -> BRK-B)."""
+    """Normalize ticker symbols for Yahoo format (BRK.B → BRK-B)."""
     out = []
     for t in tickers:
         t = str(t).strip()
@@ -117,7 +122,7 @@ def send_alert(msg: str):
         logging.warning("⚠️ No webhook URL configured — alert not sent.")
 
 
-# === SCANNING LOOP ===
+# === SCANNING CORE ===
 def scan_once():
     tz = pytz.timezone(TIMEZONE)
     now = datetime.datetime.now(tz).strftime("%Y-%m-%d %H:%M")
@@ -141,18 +146,14 @@ def scan_once():
             df["ema_fast"] = df["Close"].ewm(span=EMA_FAST).mean()
             df["ema_slow"] = df["Close"].ewm(span=EMA_SLOW).mean()
 
+            # === Extract scalars safely (pandas/NumPy proof) ===
+            prev_fast = float(df["ema_fast"].iat[-2])
+            prev_slow = float(df["ema_slow"].iat[-2])
+            last_fast = float(df["ema_fast"].iat[-1])
+            last_slow = float(df["ema_slow"].iat[-1])
+            last_close = float(df["Close"].iat[-1])
 
-
-            # === Extract true scalars safely (handles Series edge cases) ===
-            prev_fast = float(df["ema_fast"].iloc[-2:].iloc[0])
-            prev_slow = float(df["ema_slow"].iloc[-2:].iloc[0])
-            last_fast = float(df["ema_fast"].iloc[-1:].iloc[0])
-            last_slow = float(df["ema_slow"].iloc[-1:].iloc[0])
-            last_close = float(df["Close"].iloc[-1:].iloc[0])
-
-
-
-            # === Validate and check signals ===
+            # === Validate data ===
             if pd.isna(last_close) or pd.isna(last_fast) or pd.isna(last_slow):
                 logging.warning(
                     f"⚠️ Incomplete data for {sym}. "

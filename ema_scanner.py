@@ -1,148 +1,156 @@
 import yfinance as yf
 import pandas as pd
-import time, requests, datetime, pytz, logging, io
+import requests
+import time
+import datetime
+import pytz
+import logging
+from io import StringIO
 
-# -------------------- CONFIG --------------------
+# === CONFIG ===
 EMA_FAST = 13
 EMA_SLOW = 21
 EMA_TREND = 200
-
-TIMEFRAME_SIGNAL = "1d"     # Daily signals
-TIMEFRAME_TREND  = "4h"     # 4H trend filter
-CHECK_INTERVAL   = 15 * 60  # every 15 minutes
-TIMEZONE         = "America/New_York"
-
+TIMEFRAME = "1d"        # daily
+CHECK_INTERVAL = 900     # 15 min
 DISCORD_WEBHOOK = "https://discord.com/api/webhooks/1425616478601871400/AMbiCffNSI7lOsqLPBZ5UDPOStNW0UgcAJAqMU0D1QxDzD2EymlnrbTQxN44XErNkaXm"
+TEST_ALERT_ON_START = False
 
-# -------------------- LOGGING --------------------
+# === Logging ===
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s - %(message)s",
     datefmt="%Y-%m-%d %H:%M:%S",
 )
-tz = pytz.timezone(TIMEZONE)
 
-# -------------------- DISCORD --------------------
-def send_alert(message: str):
+# === Functions ===
+def get_sp500_tickers():
+    """Load S&P 500 tickers from Wikipedia (fallback to local list if blocked)."""
+    url = "https://en.wikipedia.org/wiki/List_of_S%26P_500_companies"
     try:
-        if not DISCORD_WEBHOOK:
-            logging.warning("⚠️ No webhook URL configured — alert not sent.")
-            return
-        r = requests.post(DISCORD_WEBHOOK, json={"content": message})
-        if r.status_code == 204:
-            logging.info("✅ Sent alert to Discord.")
-        else:
-            logging.warning(f"⚠️ Discord response {r.status_code}: {r.text}")
+        tables = pd.read_html(url)
+        tickers = tables[0]["Symbol"].tolist()
+        logging.info(f"Loaded {len(tickers)} S&P 500 tickers from Wikipedia.")
+        return tickers
     except Exception as e:
-        logging.error(f"Error sending alert: {e}")
+        logging.warning(f"Error loading S&P 500 list: {e}")
+        # fallback sample
+        return ["AAPL", "MSFT", "AMZN", "NVDA", "GOOG", "META", "TSLA", "AMD", "NFLX", "INTC"]
 
-# -------------------- LOAD TICKERS --------------------
-def load_tickers():
-    """Load S&P500 and biotech list."""
+def get_biotech_tickers():
+    """Fetch biotech tickers from NASDAQ screener or fallback list."""
     try:
-        tables = pd.read_html("https://en.wikipedia.org/wiki/List_of_S%26P_500_companies")
-        sp500 = tables[0]["Symbol"].tolist()
-        logging.info(f"✅ Loaded {len(sp500)} S&P 500 tickers.")
+        html = pd.read_html("https://en.wikipedia.org/wiki/List_of_biotechnology_companies")
+        all_symbols = []
+        for df in html:
+            if "Ticker" in df.columns:
+                all_symbols += df["Ticker"].dropna().tolist()
+        all_symbols = [s for s in all_symbols if isinstance(s, str) and s.isalpha()]
+        if all_symbols:
+            logging.info(f"Loaded {len(all_symbols)} biotech tickers from Wikipedia.")
+            return all_symbols
     except Exception as e:
-        logging.error(f"⚠️ Could not load S&P500 list: {e}")
-        sp500 = []
-
-    biotech = [
-        "AMGN","REGN","VRTX","GILD","BIIB","ILMN","NBIX","EXEL","ALNY","INCY","SGEN",
-        "CRSP","BGNE","BMRN","NBIX","KRTX","XLRN","MRNA","NTLA","BEAM","EDIT","SRPT",
-        "RNA","TMDX","CYT","ARWR","VERV","TWST","EVGN","DNLI"
+        logging.warning(f"Error loading biotech list: {e}")
+    # fallback
+    fallback = [
+        "BIIB","REGN","VRTX","GILD","ILMN","MRNA","BMRN","ALNY","EXEL","NBIX",
+        "INCY","SRPT","RPRX","IONS","TECH","CYT","CRSP","SGEN","DXCM","VIR",
+        "AMGN","MDGL","TWST","BEAM","NTLA","HALO","ACAD","SGMO","BLUE","ARWR"
     ]
-    logging.info(f"✅ Added {len(biotech)} biotech tickers.")
-    tickers = list(set(sp500 + biotech))
+    logging.info(f"Using fallback biotech list of {len(fallback)} tickers.")
+    return fallback
+
+def get_all_tickers():
+    tickers = list(set(get_sp500_tickers() + get_biotech_tickers()))
     logging.info(f"Total tickers to scan: {len(tickers)}")
     return tickers
 
-SYMBOLS = load_tickers()
+def notify_discord(message: str):
+    """Send message to Discord webhook."""
+    if not DISCORD_WEBHOOK:
+        logging.warning("⚠️ No webhook URL configured — alert not sent.")
+        return
+    try:
+        requests.post(DISCORD_WEBHOOK, json={"content": message})
+    except Exception as e:
+        logging.error(f"Error sending to Discord: {e}")
 
-# -------------------- DATA HELPERS --------------------
-def get_data(symbol: str, period: str, interval: str):
-    """Download and align historical data to NY timezone."""
-    df = yf.download(symbol, period=period, interval=interval, progress=False)
-    if df.empty:
-        raise ValueError("No data returned")
+def scan_symbol(sym):
+    """Scan a single ticker for EMA crossovers with 4H trend filter."""
+    try:
+        # === DAILY DATA ===
+        df_d = yf.download(sym, period="200d", interval="1d", progress=False)
+        if df_d.empty or len(df_d) < EMA_SLOW + 2:
+            return None
 
-    # --- Fix: handle both naive and tz-aware indexes safely ---
-    if df.index.tz is None:
-        df.index = df.index.tz_localize("UTC").tz_convert("America/New_York")
-    else:
-        df.index = df.index.tz_convert("America/New_York")
+        df_d["ema_fast"] = df_d["Close"].ewm(span=EMA_FAST).mean()
+        df_d["ema_slow"] = df_d["Close"].ewm(span=EMA_SLOW).mean()
 
-    return df
+        # --- TradingView-style confirmed crossover (Option B) ---
+        cross_up = (
+            df_d["ema_fast"].shift(2).iloc[-1] < df_d["ema_slow"].shift(2).iloc[-1]
+        ) and (
+            df_d["ema_fast"].shift(1).iloc[-1] > df_d["ema_slow"].shift(1).iloc[-1]
+        )
 
-# -------------------- CORE SCAN LOGIC --------------------
-def scan_symbol(sym: str):
-    """Check one symbol for EMA crossover signals with 4H trend filter."""
-    df_d = get_data(sym, "200d", TIMEFRAME_SIGNAL)
-    df_4h = get_data(sym, "90d", TIMEFRAME_TREND)
+        cross_dn = (
+            df_d["ema_fast"].shift(2).iloc[-1] > df_d["ema_slow"].shift(2).iloc[-1]
+        ) and (
+            df_d["ema_fast"].shift(1).iloc[-1] < df_d["ema_slow"].shift(1).iloc[-1]
+        )
 
-    # --- Compute EMAs ---
-    df_d["ema_fast"] = df_d["Close"].ewm(span=EMA_FAST).mean()
-    df_d["ema_slow"] = df_d["Close"].ewm(span=EMA_SLOW).mean()
-    df_4h["ema_trend"] = df_4h["Close"].ewm(span=EMA_TREND).mean()
+        # === 4H TREND FILTER ===
+        df_4h = yf.download(sym, period="200d", interval="4h", progress=False)
+        if df_4h.empty:
+            return None
+        df_4h["ema_trend"] = df_4h["Close"].ewm(span=EMA_TREND).mean()
+        ema_4h_last = float(df_4h["ema_trend"].iloc[-1])
+        last_close = float(df_d["Close"].iloc[-1])
 
-    # --- Crossovers on daily timeframe ---
-    prev_fast = df_d["ema_fast"].iloc[-2]
-    prev_slow = df_d["ema_slow"].iloc[-2]
-    last_fast = df_d["ema_fast"].iloc[-1]
-    last_slow = df_d["ema_slow"].iloc[-1]
-    last_close = float(df_d["Close"].iloc[-1])
+        # === FILTERS ===
+        trend_up = last_close > ema_4h_last
+        trend_dn = last_close < ema_4h_last
 
-    cross_up  = prev_fast < prev_slow and last_fast > last_slow
-    cross_dn  = prev_fast > prev_slow and last_fast < last_slow
+        if cross_up and trend_up:
+            return f"📈 {sym} BUY @ {last_close:.2f} (Daily EMA13>EMA21, above 4H EMA200)"
+        elif cross_dn and trend_dn:
+            return f"🔻 {sym} SELL @ {last_close:.2f} (Daily EMA13<EMA21, below 4H EMA200)"
+        else:
+            return None
 
-    # --- Trend filter (4H EMA200) ---
-    ema_trend_4h = float(df_4h["ema_trend"].iloc[-1])
-    trend_up = last_close > ema_trend_4h
-    trend_dn = last_close < ema_trend_4h
+    except Exception as e:
+        logging.error(f"Error scanning {sym}: {e}")
+        return None
 
-    signal = None
-    if cross_up and trend_up:
-        signal = f"📈 {sym} BUY @ {last_close:.2f} (Daily EMA13>EMA21, above 4H EMA200)"
-    elif cross_dn and trend_dn:
-        signal = f"🔻 {sym} SELL @ {last_close:.2f} (Daily EMA13<EMA21, below 4H EMA200)"
+# === Main loop ===
+def main():
+    tickers = get_all_tickers()
+    logging.info("🚀 EMA Scanner Bot Started — scanning every 900 seconds")
 
-    return signal
-
-# -------------------- MAIN LOOP --------------------
-def run_scanner():
-    logging.info(f"🚀 EMA Scanner Bot (Synced) — scanning every {CHECK_INTERVAL//60} min")
-    last_daily_scan_date = None
+    if TEST_ALERT_ON_START:
+        notify_discord("✅ EMA Scanner is online and ready to scan markets.")
 
     while True:
         try:
-            now = datetime.datetime.now(tz)
-            # Only run once per closed daily candle
-            if last_daily_scan_date == now.date():
-                time.sleep(CHECK_INTERVAL)
-                continue
-
             signals = []
-            for sym in SYMBOLS:
-                try:
-                    sig = scan_symbol(sym)
-                    if sig:
-                        signals.append(sig)
-                except Exception as e:
-                    logging.error(f"Error scanning {sym}: {e}")
+            for sym in tickers:
+                result = scan_symbol(sym)
+                if result:
+                    signals.append(result)
 
             if signals:
-                msg = f"**EMA Cross Alerts — {now.strftime('%Y-%m-%d %H:%M')}**\n" + "\n".join(signals)
-                send_alert(msg)
+                message = f"**EMA Cross Alerts — {datetime.datetime.now():%Y-%m-%d %H:%M}**\n" + "\n".join(signals)
+                notify_discord(message)
+                logging.info(message)
             else:
-                logging.info(f"{now.strftime('%H:%M')} — No new signals today")
+                logging.info(f"{datetime.datetime.now():%H:%M} — No signals")
 
-            last_daily_scan_date = now.date()
             time.sleep(CHECK_INTERVAL)
 
         except Exception as e:
-            logging.error(f"Main loop error: {e}")
+            logging.error(f"Fatal loop error: {e}")
             time.sleep(60)
 
-# -------------------- START --------------------
+# === Run ===
 if __name__ == "__main__":
-    run_scanner()
+    main()

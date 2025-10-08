@@ -65,8 +65,13 @@ def get_data(symbol: str, period: str, interval: str):
     df = yf.download(symbol, period=period, interval=interval, progress=False)
     if df.empty:
         raise ValueError("No data returned")
-    # align to NY time to match TradingView
-    df.index = df.index.tz_localize("UTC").tz_convert("America/New_York")
+
+    # --- Fix: handle both naive and tz-aware indexes safely ---
+    if df.index.tz is None:
+        df.index = df.index.tz_localize("UTC").tz_convert("America/New_York")
+    else:
+        df.index = df.index.tz_convert("America/New_York")
+
     return df
 
 # -------------------- CORE SCAN LOGIC --------------------

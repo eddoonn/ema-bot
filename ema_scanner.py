@@ -146,12 +146,13 @@ def scan_once():
             df["ema_fast"] = df["Close"].ewm(span=EMA_FAST).mean()
             df["ema_slow"] = df["Close"].ewm(span=EMA_SLOW).mean()
 
-            # === Extract scalars safely (pandas/NumPy proof) ===
-            prev_fast = float(df["ema_fast"].iat[-2])
-            prev_slow = float(df["ema_slow"].iat[-2])
-            last_fast = float(df["ema_fast"].iat[-1])
-            last_slow = float(df["ema_slow"].iat[-1])
-            last_close = float(df["Close"].iat[-1])
+            # === Universal scalar extraction (works across all Pandas builds) ===
+            prev_fast = float(df.iloc[-2][df.columns.get_loc("ema_fast")])
+            prev_slow = float(df.iloc[-2][df.columns.get_loc("ema_slow")])
+            last_fast = float(df.iloc[-1][df.columns.get_loc("ema_fast")])
+            last_slow = float(df.iloc[-1][df.columns.get_loc("ema_slow")])
+            last_close = float(df.iloc[-1][df.columns.get_loc("Close")])
+
 
             # === Validate data ===
             if pd.isna(last_close) or pd.isna(last_fast) or pd.isna(last_slow):

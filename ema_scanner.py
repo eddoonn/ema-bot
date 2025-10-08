@@ -1,6 +1,6 @@
 import yfinance as yf
 import pandas as pd
-import time, requests, datetime, pytz, logging
+import time, requests, datetime, pytz, logging, io
 
 # -------------------- CONFIG --------------------
 EMA_FAST = 13
@@ -14,9 +14,6 @@ TIMEZONE         = "America/New_York"
 
 DISCORD_WEBHOOK = "https://discord.com/api/webhooks/1425616478601871400/AMbiCffNSI7lOsqLPBZ5UDPOStNW0UgcAJAqMU0D1QxDzD2EymlnrbTQxN44XErNkaXm"
 
-# small test subset for speed; replace later with your full S&P+biotech list
-SYMBOLS = ["AAPL","MSFT","TSLA","NVDA","AMZN","META","GOOG"]
-
 # -------------------- LOGGING --------------------
 logging.basicConfig(
     level=logging.INFO,
@@ -25,6 +22,7 @@ logging.basicConfig(
 )
 tz = pytz.timezone(TIMEZONE)
 
+# -------------------- DISCORD --------------------
 def send_alert(message: str):
     """Send message to Discord webhook."""
     try:
@@ -38,6 +36,30 @@ def send_alert(message: str):
             logging.warning(f"⚠️ Discord response {r.status_code}: {r.text}")
     except Exception as e:
         logging.error(f"Error sending alert: {e}")
+
+# -------------------- LOAD TICKERS --------------------
+def load_tickers():
+    """Load S&P500 from Wikipedia and add top biotech tickers."""
+    try:
+        tables = pd.read_html("https://en.wikipedia.org/wiki/List_of_S%26P_500_companies")
+        sp500 = tables[0]["Symbol"].tolist()
+        logging.info(f"✅ Loaded {len(sp500)} S&P 500 tickers.")
+    except Exception as e:
+        logging.error(f"⚠️ Could not load S&P500 list: {e}")
+        sp500 = []
+
+    biotech = [
+        "AMGN","REGN","VRTX","GILD","BIIB","ILMN","NBIX","EXEL","ALNY","INCY","SGEN",
+        "CRSP","BGNE","BMRN","NBIX","KRTX","XLRN","MRNA","NTLA","BEAM","EDIT","SRPT",
+        "RNA","TMDX","CYT","ARWR","VERV","TWST","EVGN","DNLI"
+    ]
+    logging.info(f"✅ Added {len(biotech)} biotech tickers.")
+
+    tickers = list(set(sp500 + biotech))
+    logging.info(f"Total tickers to scan: {len(tickers)}")
+    return tickers
+
+SYMBOLS = load_tickers()
 
 # -------------------- DATA HELPERS --------------------
 def get_data(symbol: str, period: str = "90d", interval: str = "1d"):
@@ -53,6 +75,7 @@ def scan_symbol(sym: str):
     df_d = get_data(sym, period="120d", interval=TIMEFRAME_SIGNAL)
     df_4h = get_data(sym, period="60d", interval=TIMEFRAME_TREND)
 
+    # --- Compute EMAs ---
     df_d["ema_fast"] = df_d["Close"].ewm(span=EMA_FAST).mean()
     df_d["ema_slow"] = df_d["Close"].ewm(span=EMA_SLOW).mean()
     df_4h["ema_trend"] = df_4h["Close"].ewm(span=EMA_TREND).mean()
@@ -88,8 +111,9 @@ def run_scanner():
 
     while True:
         try:
-            # run only once per finished daily bar
             now = datetime.datetime.now(tz)
+
+            # only run once per completed daily candle
             if last_daily_scan_date == now.date():
                 time.sleep(CHECK_INTERVAL)
                 continue

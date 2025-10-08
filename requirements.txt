@@ -3,3 +3,4 @@ pandas
 requests
 pytz
 lxml
+html5lib

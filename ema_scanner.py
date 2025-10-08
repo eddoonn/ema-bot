@@ -16,7 +16,7 @@ TIMEFRAME = "1h"           # e.g. "1h", "4h", "1d"
 CHECK_INTERVAL = 15 * 60   # seconds between scans
 TIMEZONE = "America/New_York"
 
-DISCORD_WEBHOOK = "PASTE_YOUR_DISCORD_WEBHOOK_HERE"
+DISCORD_WEBHOOK = "https://discord.com/api/webhooks/1425616478601871400/AMbiCffNSI7lOsqLPBZ5UDPOStNW0UgcAJAqMU0D1QxDzD2EymlnrbTQxN44XErNkaXm"
 TEST_ALERT_ON_START = False
 
 # optional: silence irrelevant deprecation chatter

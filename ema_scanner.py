@@ -141,12 +141,14 @@ def scan_once():
             df["ema_fast"] = df["Close"].ewm(span=EMA_FAST).mean()
             df["ema_slow"] = df["Close"].ewm(span=EMA_SLOW).mean()
 
-            # === Extract scalar values safely (NumPy + Pandas proof) ===
-            prev_fast = df["ema_fast"].to_numpy()[-2].item()
-            prev_slow = df["ema_slow"].to_numpy()[-2].item()
-            last_fast = df["ema_fast"].to_numpy()[-1].item()
-            last_slow = df["ema_slow"].to_numpy()[-1].item()
-            last_close = df["Close"].to_numpy()[-1].item()
+
+            # === Extract scalar values safely (NumPy 1.25+ proof) ===
+            prev_fast = float(df["ema_fast"].iloc[-2])
+            prev_slow = float(df["ema_slow"].iloc[-2])
+            last_fast = float(df["ema_fast"].iloc[-1])
+            last_slow = float(df["ema_slow"].iloc[-1])
+            last_close = float(df["Close"].iloc[-1])
+
 
             # === Validate and check signals ===
             if pd.isna(last_close) or pd.isna(last_fast) or pd.isna(last_slow):

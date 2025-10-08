@@ -7,23 +7,24 @@ import pytz
 import logging
 from urllib.request import Request, urlopen
 
-# === CONFIG ===
+# === CONFIGURATION ===
 EMA_FAST = 13
 EMA_SLOW = 21
-TIMEFRAME = "1h"           # "1h", "4h", "1d"
-CHECK_INTERVAL = 15 * 60   # seconds
+TIMEFRAME = "1h"           # e.g. "1h", "4h", "1d"
+CHECK_INTERVAL = 15 * 60   # seconds between scans
 TIMEZONE = "America/New_York"
-DISCORD_WEBHOOK = "PASTE_YOUR_DISCORD_WEBHOOK_HERE"
 
-# Optional: send a one-time test message at startup
+DISCORD_WEBHOOK = "PASTE_YOUR_DISCORD_WEBHOOK_HERE"
 TEST_ALERT_ON_START = False
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(message)s")
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s - %(message)s",
+)
 
-
-# === HELPERS ===
+# === HELPER FUNCTIONS ===
 def safe_html_read(url: str):
-    """Load HTML with a browser-like user agent to avoid 403, return list[tables] or None."""
+    """Fetch an HTML page using a browser-like header to avoid 403s."""
     try:
         req = Request(url, headers={"User-Agent": "Mozilla/5.0"})
         with urlopen(req) as r:
@@ -35,19 +36,17 @@ def safe_html_read(url: str):
 
 
 def _normalize_for_yahoo(tickers):
-    """Yahoo uses '-' where many lists use '.' (e.g., BRK.B -> BRK-B)."""
+    """Fix symbols for Yahoo Finance format (e.g. BRK.B -> BRK-B)."""
     out = []
     for t in tickers:
         t = str(t).strip()
-        if not t:
-            continue
-        out.append(t.replace(".", "-"))
+        if t:
+            out.append(t.replace(".", "-"))
     return out
 
 
 def get_sp500_tickers():
-    """Scrape S&P 500 tickers from Wikipedia; fallback to a public CSV."""
-    # Primary: Wikipedia
+    """Scrape S&P 500 tickers, fallback to CSV or minimal list."""
     tables = safe_html_read("https://en.wikipedia.org/wiki/List_of_S%26P_500_companies")
     if tables:
         try:
@@ -59,7 +58,6 @@ def get_sp500_tickers():
         except Exception as e:
             logging.error("Parse S&P 500 wiki failed: %s", e)
 
-    # Fallback: GitHub dataset CSV
     try:
         csv_url = "https://raw.githubusercontent.com/datasets/s-and-p-500-companies/main/data/constituents.csv"
         df = pd.read_csv(csv_url)
@@ -67,16 +65,14 @@ def get_sp500_tickers():
         logging.info("Loaded %d S&P 500 tickers from GitHub CSV.", len(syms))
         return syms
     except Exception as e:
-        logging.error("Fallback S&P list failed: %s", e)
-        # final minimal fallback
+        logging.error("Fallback S&P 500 list failed: %s", e)
         return ["AAPL", "MSFT", "TSLA", "NVDA", "AMZN", "META", "GOOG"]
 
 
 def get_biotech_tickers():
-    """Try NASDAQ Biotech Index page; fallback to a static short list."""
+    """Scrape NASDAQ Biotech Index; fallback to static list."""
     tables = safe_html_read("https://en.wikipedia.org/wiki/NASDAQ_Biotechnology_Index")
     if tables:
-        # Find a table that contains a 'Ticker' or 'Symbol' column
         for df in tables:
             cols = {c.lower(): c for c in df.columns}
             if "ticker" in cols:
@@ -90,7 +86,6 @@ def get_biotech_tickers():
                 logging.info("Loaded %d biotech tickers from Wikipedia.", len(syms))
                 return syms
 
-    # Fallback static set (representative, not exhaustive)
     fallback = [
         "AMGN","BIIB","VRTX","REGN","GILD","MRNA","NBIX","EXEL","INCY","SGEN",
         "TECH","BGNE","ILMN","CRSP","NTLA","BMRN","XLRN","ALNY","RPRX","HALO",
@@ -110,8 +105,7 @@ def build_symbol_list():
 
 SYMBOLS = build_symbol_list()
 
-
-# === NOTIFICATIONS ===
+# === ALERTING ===
 def send_alert(msg: str):
     if DISCORD_WEBHOOK and DISCORD_WEBHOOK != "PASTE_YOUR_DISCORD_WEBHOOK_HERE":
         try:
@@ -123,7 +117,7 @@ def send_alert(msg: str):
         logging.warning("⚠️ No webhook URL configured — alert not sent.")
 
 
-# === SCANNER CORE ===
+# === SCANNING LOOP ===
 def scan_once():
     tz = pytz.timezone(TIMEZONE)
     now = datetime.datetime.now(tz).strftime("%Y-%m-%d %H:%M")
@@ -138,46 +132,52 @@ def scan_once():
                 progress=False,
                 auto_adjust=False,
             )
+
             if df is None or len(df) < 2:
+                logging.warning(f"⚠️ Not enough data for {sym}. Skipping.")
                 continue
 
-            # Calculate EMAs
+            # === Calculate EMAs ===
             df["ema_fast"] = df["Close"].ewm(span=EMA_FAST).mean()
             df["ema_slow"] = df["Close"].ewm(span=EMA_SLOW).mean()
 
-            # Get scalar values for EMA comparisons
-            prev_fast = float(df["ema_fast"].values[-2])
-            prev_slow = float(df["ema_slow"].values[-2])
-            last_fast = float(df["ema_fast"].values[-1])
-            last_slow = float(df["ema_slow"].values[-1])
-            last_close = float(df["Close"].values[-1])
+            # === Extract scalar values safely (NumPy + Pandas proof) ===
+            prev_fast = df["ema_fast"].to_numpy()[-2].item()
+            prev_slow = df["ema_slow"].to_numpy()[-2].item()
+            last_fast = df["ema_fast"].to_numpy()[-1].item()
+            last_slow = df["ema_slow"].to_numpy()[-1].item()
+            last_close = df["Close"].to_numpy()[-1].item()
 
+            # === Validate and check signals ===
+            if pd.isna(last_close) or pd.isna(last_fast) or pd.isna(last_slow):
+                logging.warning(
+                    f"⚠️ Incomplete data for {sym}. "
+                    f"Close={last_close}, EMAfast={last_fast}, EMAslow={last_slow}. Skipping signal check."
+                )
+            else:
+                cross_up = (prev_fast < prev_slow) and (last_fast > last_slow)
+                cross_dn = (prev_fast > prev_slow) and (last_fast < last_slow)
 
-
-            cross_up = (prev_fast < prev_slow) and (last_fast > last_slow)
-            cross_dn = (prev_fast > prev_slow) and (last_fast < last_slow)
-
-            if cross_up:
-                signals.append(f"📈 {sym} BUY @ {last_close:.2f}")
-            elif cross_dn:
-                signals.append(f"🔻 {sym} SELL @ {last_close:.2f}")
+                if cross_up:
+                    signals.append(f"📈 {sym} BUY @ {last_close:.2f}")
+                elif cross_dn:
+                    signals.append(f"🔻 {sym} SELL @ {last_close:.2f}")
 
         except Exception as e:
-            logging.error("Error scanning %s: %s", sym, e)
+            logging.error(f"Error scanning {sym}: {e}")
 
     if signals:
         msg = f"**EMA Cross Alerts — {now}**\n" + "\n".join(signals)
         send_alert(msg)
     else:
-        logging.info("%s — No signals", now)
+        logging.info(f"{now} — No signals")
 
 
 # === MAIN LOOP ===
 if __name__ == "__main__":
-    logging.info("🚀 EMA Scanner Bot Started — scanning every %d seconds", CHECK_INTERVAL)
+    logging.info(f"🚀 EMA Scanner Bot Started — scanning every {CHECK_INTERVAL} seconds")
     if TEST_ALERT_ON_START:
         send_alert("✅ Startup test: Discord webhook is working.")
     while True:
         scan_once()
         time.sleep(CHECK_INTERVAL)
-

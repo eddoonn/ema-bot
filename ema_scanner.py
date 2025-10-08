@@ -24,7 +24,6 @@ tz = pytz.timezone(TIMEZONE)
 
 # -------------------- DISCORD --------------------
 def send_alert(message: str):
-    """Send message to Discord webhook."""
     try:
         if not DISCORD_WEBHOOK:
             logging.warning("⚠️ No webhook URL configured — alert not sent.")
@@ -39,7 +38,7 @@ def send_alert(message: str):
 
 # -------------------- LOAD TICKERS --------------------
 def load_tickers():
-    """Load S&P500 from Wikipedia and add top biotech tickers."""
+    """Load S&P500 and biotech list."""
     try:
         tables = pd.read_html("https://en.wikipedia.org/wiki/List_of_S%26P_500_companies")
         sp500 = tables[0]["Symbol"].tolist()
@@ -54,7 +53,6 @@ def load_tickers():
         "RNA","TMDX","CYT","ARWR","VERV","TWST","EVGN","DNLI"
     ]
     logging.info(f"✅ Added {len(biotech)} biotech tickers.")
-
     tickers = list(set(sp500 + biotech))
     logging.info(f"Total tickers to scan: {len(tickers)}")
     return tickers
@@ -62,18 +60,20 @@ def load_tickers():
 SYMBOLS = load_tickers()
 
 # -------------------- DATA HELPERS --------------------
-def get_data(symbol: str, period: str = "90d", interval: str = "1d"):
-    """Download historical data for a symbol."""
+def get_data(symbol: str, period: str, interval: str):
+    """Download and align historical data to NY timezone."""
     df = yf.download(symbol, period=period, interval=interval, progress=False)
     if df.empty:
         raise ValueError("No data returned")
+    # align to NY time to match TradingView
+    df.index = df.index.tz_localize("UTC").tz_convert("America/New_York")
     return df
 
 # -------------------- CORE SCAN LOGIC --------------------
 def scan_symbol(sym: str):
     """Check one symbol for EMA crossover signals with 4H trend filter."""
-    df_d = get_data(sym, period="120d", interval=TIMEFRAME_SIGNAL)
-    df_4h = get_data(sym, period="60d", interval=TIMEFRAME_TREND)
+    df_d = get_data(sym, "200d", TIMEFRAME_SIGNAL)
+    df_4h = get_data(sym, "90d", TIMEFRAME_TREND)
 
     # --- Compute EMAs ---
     df_d["ema_fast"] = df_d["Close"].ewm(span=EMA_FAST).mean()
@@ -90,12 +90,11 @@ def scan_symbol(sym: str):
     cross_up  = prev_fast < prev_slow and last_fast > last_slow
     cross_dn  = prev_fast > prev_slow and last_fast < last_slow
 
-    # --- Trend filter from 4H timeframe ---
+    # --- Trend filter (4H EMA200) ---
     ema_trend_4h = float(df_4h["ema_trend"].iloc[-1])
     trend_up = last_close > ema_trend_4h
     trend_dn = last_close < ema_trend_4h
 
-    # --- Combine signals with filter ---
     signal = None
     if cross_up and trend_up:
         signal = f"📈 {sym} BUY @ {last_close:.2f} (Daily EMA13>EMA21, above 4H EMA200)"
@@ -106,14 +105,13 @@ def scan_symbol(sym: str):
 
 # -------------------- MAIN LOOP --------------------
 def run_scanner():
-    logging.info(f"🚀 EMA Scanner Bot Started — scanning every {CHECK_INTERVAL//60} minutes")
+    logging.info(f"🚀 EMA Scanner Bot (Synced) — scanning every {CHECK_INTERVAL//60} min")
     last_daily_scan_date = None
 
     while True:
         try:
             now = datetime.datetime.now(tz)
-
-            # only run once per completed daily candle
+            # Only run once per closed daily candle
             if last_daily_scan_date == now.date():
                 time.sleep(CHECK_INTERVAL)
                 continue
@@ -131,7 +129,7 @@ def run_scanner():
                 msg = f"**EMA Cross Alerts — {now.strftime('%Y-%m-%d %H:%M')}**\n" + "\n".join(signals)
                 send_alert(msg)
             else:
-                logging.info(f"{now.strftime('%H:%M')} — No signals today")
+                logging.info(f"{now.strftime('%H:%M')} — No new signals today")
 
             last_daily_scan_date = now.date()
             time.sleep(CHECK_INTERVAL)

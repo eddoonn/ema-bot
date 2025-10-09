@@ -155,4 +155,5 @@ def record_signal(signal_type, sym, price):
     else:
         df.to_csv(LOG_FILE, index=False)
 
-def evaluate_old_
+def evaluate_old_signals():
+

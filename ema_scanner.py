@@ -156,4 +156,53 @@ def record_signal(signal_type, sym, price):
         df.to_csv(LOG_FILE, index=False)
 
 def evaluate_old_signals():
+    if not os.path.exists(LOG_FILE):
+        return None
+
+    df = pd.read_csv(LOG_FILE)
+    df["date"] = pd.to_datetime(df["date"])
+    cutoff = datetime.date.today() - datetime.timedelta(days=HOLD_DAYS)
+
+    eligible = df[df["date"].dt.date <= cutoff]
+    if eligible.empty:
+        return None
+
+    results = []
+    for _, row in eligible.iterrows():
+        sym = row["symbol"]
+        entry_price = row["price"]
+        signal_type = row["signal"]
+        entry_date = row["date"]
+        try:
+            df_hist = yf.download(sym, start=entry_date, period="10d", interval="1d", progress=False)
+            if len(df_hist) < HOLD_DAYS:
+                continue
+            exit_price = df_hist["Close"].iloc[HOLD_DAYS - 1]
+            ret = (exit_price - entry_price) / entry_price
+            if signal_type == "SELL":
+                ret = -ret
+            profit = ret * CAPITAL_PER_TRADE
+            results.append((sym, signal_type, entry_price, exit_price, profit))
+        except Exception as e:
+            logging.error(f"Error evaluating {sym}: {e}")
+
+    if not results:
+        return None
+
+    total = sum(p[4] for p in results)
+    winrate = sum(1 for p in results if p[4] > 0) / len(results) * 100
+    avg_trade = total / len(results)
+
+    msg = "**📊 Weekly Performance Report**\n"
+    for sym, side, entry, exitp, prof in results:
+        emoji = "✅" if prof > 0 else "❌"
+        msg += f"{emoji} {sym} {side} from {entry:.2f} → {exitp:.2f} | {prof:+.2f} USD\n"
+    msg += f"\n**Total:** {total:+.2f} USD | **Winrate:** {winrate:.1f}% | **Avg:** {avg_trade:+.2f} USD/trade"
+
+    # remove evaluated rows so each is only reported once
+    df = df[~df["symbol"].isin([r[0] for r in results])]
+    df.to_csv(LOG_FILE, index=False)
+
+    return msg
+
 

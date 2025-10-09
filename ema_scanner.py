@@ -195,18 +195,38 @@ def fetch_emas_and_filters(symbol):
         raise ValueError(f"{symbol}: {e}")
 
 def scan_tickers(tickers):
-    """Main scanner with filters."""
+    """Main scanner with all numeric safety checks and indicator filters."""
     conf_signals = []
+
     for sym in tickers:
         try:
             df, ema_trend = fetch_emas_and_filters(sym)
-            prev_fast, prev_slow = df["ema_fast"].iloc[-2], df["ema_slow"].iloc[-2]
-            ema_fast,  ema_slow  = df["ema_fast"].iloc[-1], df["ema_slow"].iloc[-1]
-            close = df["Close"].iloc[-1]
-            rsi, adx = df["rsi"].iloc[-1], df["adx"].iloc[-1]
-            atr, atr_mean = df["atr"].iloc[-1], df["atr"].rolling(100).mean().iloc[-1]
-            obv = df["obv"]
 
+            # ---- Sanitize data ----
+            df = df.apply(pd.to_numeric, errors="coerce")
+            ema_trend = float(pd.to_numeric(ema_trend, errors="coerce"))
+
+            # Retrieve latest indicator values safely
+            prev_fast = float(df["ema_fast"].iloc[-2])
+            prev_slow = float(df["ema_slow"].iloc[-2])
+            ema_fast  = float(df["ema_fast"].iloc[-1])
+            ema_slow  = float(df["ema_slow"].iloc[-1])
+            close     = float(df["Close"].iloc[-1])
+            rsi       = float(df["rsi"].iloc[-1])
+            adx       = float(df["adx"].iloc[-1])
+            atr       = float(df["atr"].iloc[-1])
+            atr_mean  = float(df["atr"].rolling(100).mean().iloc[-1])
+
+            # OBV can stay as a series
+            obv = df["obv"].copy()
+
+            # Guard: skip tickers with missing data
+            if any(map(lambda x: pd.isna(x) or np.isnan(x),
+                       [ema_fast, ema_slow, ema_trend, rsi, adx, atr, atr_mean, close])):
+                logging.warning(f"Skipping {sym}: NaN or invalid numeric data.")
+                continue
+
+            # Define key boolean states
             crossed_up   = prev_fast < prev_slow and ema_fast > ema_slow
             crossed_down = prev_fast > prev_slow and ema_fast < ema_slow
             is_above_trend = close > ema_trend
@@ -214,13 +234,13 @@ def scan_tickers(tickers):
             obv_rising = obv.iloc[-1] > obv.iloc[-5] if len(obv) > 5 else True
 
             # --- Long confirmation ---
-            if crossed_up and is_above_trend and rsi > 55 and adx > 20 and atr > 0.8*atr_mean and obv_rising:
+            if crossed_up and is_above_trend and rsi > 55 and adx > 20 and atr > 0.8 * atr_mean and obv_rising:
                 msg = f"📈 {sym} BUY @ {close:.2f} | RSI {rsi:.1f}, ADX {adx:.1f}"
                 conf_signals.append(msg)
                 record_signal("BUY", sym, close)
 
             # --- Short confirmation ---
-            elif crossed_down and is_below_trend and rsi < 45 and adx > 20 and atr > 0.8*atr_mean and not obv_rising:
+            elif crossed_down and is_below_trend and rsi < 45 and adx > 20 and atr > 0.8 * atr_mean and not obv_rising:
                 msg = f"🔻 {sym} SELL @ {close:.2f} | RSI {rsi:.1f}, ADX {adx:.1f}"
                 conf_signals.append(msg)
                 record_signal("SELL", sym, close)

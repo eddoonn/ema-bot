@@ -195,38 +195,38 @@ def fetch_emas_and_filters(symbol):
         raise ValueError(f"{symbol}: {e}")
 
 def scan_tickers(tickers):
-    """Main scanner with all numeric safety checks and indicator filters."""
+    """Main scanner with full numeric safety and indicator filters."""
     conf_signals = []
 
     for sym in tickers:
         try:
             df, ema_trend = fetch_emas_and_filters(sym)
 
-            # ---- Sanitize data ----
-            df = df.apply(pd.to_numeric, errors="coerce")
-            ema_trend = float(pd.to_numeric(ema_trend, errors="coerce"))
+            # ---- Sanitize dataframe ----
+            for col in df.columns:
+                df[col] = df[col].apply(to_float)
+            ema_trend = to_float(ema_trend)
 
-            # Retrieve latest indicator values safely
-            prev_fast = float(df["ema_fast"].iloc[-2])
-            prev_slow = float(df["ema_slow"].iloc[-2])
-            ema_fast  = float(df["ema_fast"].iloc[-1])
-            ema_slow  = float(df["ema_slow"].iloc[-1])
-            close     = float(df["Close"].iloc[-1])
-            rsi       = float(df["rsi"].iloc[-1])
-            adx       = float(df["adx"].iloc[-1])
-            atr       = float(df["atr"].iloc[-1])
-            atr_mean  = float(df["atr"].rolling(100).mean().iloc[-1])
+            # Retrieve indicator values safely
+            prev_fast = to_float(df["ema_fast"].iloc[-2])
+            prev_slow = to_float(df["ema_slow"].iloc[-2])
+            ema_fast  = to_float(df["ema_fast"].iloc[-1])
+            ema_slow  = to_float(df["ema_slow"].iloc[-1])
+            close     = to_float(df["Close"].iloc[-1])
+            rsi       = to_float(df["rsi"].iloc[-1])
+            adx       = to_float(df["adx"].iloc[-1])
+            atr       = to_float(df["atr"].iloc[-1])
+            atr_mean  = to_float(df["atr"].rolling(100).mean().iloc[-1])
+            obv       = df["obv"].copy()
 
-            # OBV can stay as a series
-            obv = df["obv"].copy()
-
-            # Guard: skip tickers with missing data
-            if any(map(lambda x: pd.isna(x) or np.isnan(x),
-                       [ema_fast, ema_slow, ema_trend, rsi, adx, atr, atr_mean, close])):
+            # Skip invalids
+            vals = [prev_fast, prev_slow, ema_fast, ema_slow,
+                    close, rsi, adx, atr, atr_mean, ema_trend]
+            if any(map(lambda x: pd.isna(x) or np.isnan(x), vals)):
                 logging.warning(f"Skipping {sym}: NaN or invalid numeric data.")
                 continue
 
-            # Define key boolean states
+            # Define states
             crossed_up   = prev_fast < prev_slow and ema_fast > ema_slow
             crossed_down = prev_fast > prev_slow and ema_fast < ema_slow
             is_above_trend = close > ema_trend

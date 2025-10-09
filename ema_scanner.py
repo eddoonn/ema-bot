@@ -87,7 +87,7 @@ def get_biotech_tickers():
 # ----------------------------------------------------------------------
 
 def fetch_emas(symbol):
-    """Return EMAs (13, 21 daily; 200 on 4h) and latest Close."""
+    """Return EMAs (13, 21 daily; 200 on 4h) and latest Close for both live and confirmed modes."""
     df_daily = yf.download(symbol, period="60d", interval=TIMEFRAME_DAILY, progress=False)
     df_4h    = yf.download(symbol, period="180d", interval=TIMEFRAME_4H, progress=False)
 
@@ -98,37 +98,64 @@ def fetch_emas(symbol):
     df_daily["ema_slow"] = df_daily["Close"].ewm(span=EMA_SLOW).mean()
     df_4h["ema_trend"]   = df_4h["Close"].ewm(span=EMA_TREND).mean()
 
-    last_close = float(df_daily["Close"].iloc[-1])
-    ema_fast   = float(df_daily["ema_fast"].iloc[-1])
-    ema_slow   = float(df_daily["ema_slow"].iloc[-1])
-    ema_trend  = float(df_4h["ema_trend"].iloc[-1])
-    prev_fast  = float(df_daily["ema_fast"].iloc[-2])
-    prev_slow  = float(df_daily["ema_slow"].iloc[-2])
+    # --- Live (in-progress) data ---
+    live_close = float(df_daily["Close"].iloc[-1])
+    live_fast  = float(df_daily["ema_fast"].iloc[-1])
+    live_slow  = float(df_daily["ema_slow"].iloc[-1])
+    prev_fast_live = float(df_daily["ema_fast"].iloc[-2])
+    prev_slow_live = float(df_daily["ema_slow"].iloc[-2])
 
-    return prev_fast, prev_slow, ema_fast, ema_slow, ema_trend, last_close
+    # --- Confirmed (fully closed) data ---
+    conf_close = float(df_daily["Close"].iloc[-2])
+    conf_fast  = float(df_daily["ema_fast"].iloc[-2])
+    conf_slow  = float(df_daily["ema_slow"].iloc[-2])
+    prev_fast_conf = float(df_daily["ema_fast"].iloc[-3])
+    prev_slow_conf = float(df_daily["ema_slow"].iloc[-3])
+
+    ema_trend = float(df_4h["ema_trend"].iloc[-1])
+
+    return {
+        "live":  (prev_fast_live, prev_slow_live, live_fast, live_slow, ema_trend, live_close),
+        "confirm": (prev_fast_conf, prev_slow_conf, conf_fast, conf_slow, ema_trend, conf_close)
+    }
+
 
 def scan_tickers(tickers):
-    """Check all tickers for EMA crossovers with trend filter."""
-    signals = []
+    """Check all tickers for EMA crossovers in both live and confirmed modes."""
+    live_signals = []
+    conf_signals = []
+
     for sym in tickers:
         try:
-            prev_fast, prev_slow, ema_fast, ema_slow, ema_trend, close = fetch_emas(sym)
+            data = fetch_emas(sym)
+            for mode_name, (prev_fast, prev_slow, ema_fast, ema_slow, ema_trend, close) in data.items():
+                crossed_up   = prev_fast < prev_slow and ema_fast > ema_slow
+                crossed_down = prev_fast > prev_slow and ema_fast < ema_slow
+                is_above_trend = close > ema_trend
+                is_below_trend = close < ema_trend
 
-            crossed_up   = prev_fast < prev_slow and ema_fast > ema_slow
-            crossed_down = prev_fast > prev_slow and ema_fast < ema_slow
-            is_above_trend = close > ema_trend
-            is_below_trend = close < ema_trend
+                # Build messages
+                if crossed_up and is_above_trend:
+                    msg = f"📈 {sym} BUY @ {close:.2f} (Daily EMA13>EMA21 & above 4H EMA200)"
+                    if mode_name == "live":
+                        live_signals.append(msg)
+                    else:
+                        conf_signals.append(msg)
+                        record_signal("BUY", sym, close)
 
-            if crossed_up and is_above_trend:
-                signals.append(f"📈 {sym} BUY @ {close:.2f} (Daily EMA13>EMA21 & above 4H EMA200)")
-                record_signal("BUY", sym, close)
-            elif crossed_down and is_below_trend:
-                signals.append(f"🔻 {sym} SELL @ {close:.2f} (Daily EMA13<EMA21 & below 4H EMA200)")
-                record_signal("SELL", sym, close)
+                elif crossed_down and is_below_trend:
+                    msg = f"🔻 {sym} SELL @ {close:.2f} (Daily EMA13<EMA21 & below 4H EMA200)"
+                    if mode_name == "live":
+                        live_signals.append(msg)
+                    else:
+                        conf_signals.append(msg)
+                        record_signal("SELL", sym, close)
 
         except Exception as e:
             logging.error(f"Error scanning {sym}: {e}")
-    return signals
+
+    return live_signals, conf_signals
+
 
 # ----------------------------------------------------------------------
 # Backtest Tracker
@@ -195,17 +222,22 @@ def main():
     bio = get_biotech_tickers()
     tickers = sorted(set(sp500 + bio))
     logging.info(f"Total tickers to scan: {len(tickers)}")
-    logging.info("🚀 EMA Scanner Bot Started — scanning every 900 seconds")
+    logging.info("🚀 EMA Scanner Bot Started — hybrid mode enabled (LIVE + CONFIRMED)")
 
     while True:
-        signals = scan_tickers(tickers)
-        if signals:
-            msg = f"**EMA Cross Alerts — {datetime.datetime.now():%Y-%m-%d %H:%M}**\n" + "\n".join(signals)
+        live_signals, conf_signals = scan_tickers(tickers)
+
+        if live_signals:
+            msg = f"**⚡ EMA Cross Alerts — LIVE ({datetime.datetime.now():%Y-%m-%d %H:%M})**\n" + "\n".join(live_signals)
             send_discord_message(msg)
-        else:
+
+        if conf_signals:
+            msg = f"**✅ EMA Cross Alerts — CONFIRMED ({datetime.datetime.now():%Y-%m-%d %H:%M})**\n" + "\n".join(conf_signals)
+            send_discord_message(msg)
+
+        if not live_signals and not conf_signals:
             logging.info(f"{datetime.datetime.now():%H:%M} — No signals")
 
-        # periodic performance check
         report = evaluate_old_signals()
         if report:
             send_discord_message(report)

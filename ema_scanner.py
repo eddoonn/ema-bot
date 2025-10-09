@@ -243,6 +243,34 @@ def main():
             send_discord_message(report)
 
         time.sleep(CHECK_INTERVAL)
+      
+# ----------------------------------------------------------------------
+# FAKE WEB SERVER (to keep Render Free Web Service alive)
+# ----------------------------------------------------------------------
+from threading import Thread
+from flask import Flask
+
+app = Flask(__name__)
+
+@app.route('/')
+def home():
+    return "EMA Scanner running."
+
+def run_flask():
+    # Default Render port env var
+    port = int(os.environ.get("PORT", 10000))
+    app.run(host="0.0.0.0", port=port)
+
+# ----------------------------------------------------------------------
+# Entrypoint (start both Flask + bot)
+# ----------------------------------------------------------------------
+if __name__ == "__main__":
+    try:
+        # Start Flask in a background thread
+        Thread(target=run_flask, daemon=True).start()
+        main()
+    except Exception as e:
+        logging.error(f"Fatal error: {e}")
 
 # ----------------------------------------------------------------------
 # Entrypoint

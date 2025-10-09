@@ -64,37 +64,60 @@ def send_discord_message(content: str):
 # Ticker universe fetchers
 # ----------------------------------------------------------------------
 
+import urllib.request
+
+def safe_read_html(url):
+    """Fetch HTML with custom User-Agent to avoid 403."""
+    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
+    req = urllib.request.Request(url, headers=headers)
+    with urllib.request.urlopen(req) as resp:
+        html = resp.read()
+    return pd.read_html(html)
+
 def get_sp500_tickers():
     try:
-        html = pd.read_html("https://en.wikipedia.org/wiki/List_of_S%26P_500_companies")
-        df = html[0]
-        return df["Symbol"].tolist()
+        tables = safe_read_html("https://en.wikipedia.org/wiki/List_of_S%26P_500_companies")
+        df = tables[0]
+        tickers = df["Symbol"].tolist()
+        logging.info(f"Loaded {len(tickers)} S&P 500 tickers from Wikipedia.")
+        return tickers
     except Exception as e:
         logging.error(f"S&P500 fetch failed: {e}")
-        return ["AAPL", "MSFT", "TSLA", "NVDA", "AMZN", "GOOG", "META"]
+        return ["AAPL","MSFT","TSLA","NVDA","AMZN","GOOG","META"]
 
 def get_biotech_tickers():
     try:
-        bio = pd.read_html("https://en.wikipedia.org/wiki/List_of_biotechnology_companies")[0]
-        tickers = bio.iloc[:, 0].dropna().tolist()[:100]
+        tables = safe_read_html("https://en.wikipedia.org/wiki/List_of_biotechnology_companies")
+        bio = tables[0]
+        tickers = bio.iloc[:,0].dropna().tolist()[:100]
+        logging.info(f"Loaded {len(tickers)} biotech tickers from Wikipedia.")
         return tickers
     except Exception as e:
         logging.error(f"Biotech list error: {e}")
-        return ["BIIB", "REGN", "VRTX", "GILD", "ALNY", "ILMN"]
+        return ["BIIB","REGN","VRTX","GILD","ALNY","ILMN"]
 
 def get_nasdaq100_tickers():
     try:
-        t = pd.read_html("https://en.wikipedia.org/wiki/NASDAQ-100")[4]
-        return t["Ticker"].dropna().tolist()
-    except Exception:
-        return ["AAPL", "MSFT", "NVDA", "META", "AMZN", "GOOG", "TSLA"]
+        tables = safe_read_html("https://en.wikipedia.org/wiki/NASDAQ-100")
+        df = tables[4]
+        tickers = df["Ticker"].dropna().tolist()
+        logging.info(f"Loaded {len(tickers)} NASDAQ-100 tickers from Wikipedia.")
+        return tickers
+    except Exception as e:
+        logging.error(f"NASDAQ100 fetch failed: {e}")
+        return ["AAPL","MSFT","NVDA","META","AMZN","GOOG","TSLA"]
 
 def get_dow30_tickers():
     try:
-        t = pd.read_html("https://en.wikipedia.org/wiki/Dow_Jones_Industrial_Average")[1]
-        return t["Symbol"].dropna().tolist()
-    except Exception:
-        return ["AAPL", "MSFT", "CAT", "BA", "JNJ", "PG", "V"]
+        tables = safe_read_html("https://en.wikipedia.org/wiki/Dow_Jones_Industrial_Average")
+        df = tables[1]
+        tickers = df["Symbol"].dropna().tolist()
+        logging.info(f"Loaded {len(tickers)} Dow 30 tickers from Wikipedia.")
+        return tickers
+    except Exception as e:
+        logging.error(f"Dow30 fetch failed: {e}")
+        return ["AAPL","MSFT","CAT","BA","JNJ","PG","V"]
+
 
 def get_sector_tickers():
     return ["XLE","XLF","XLK","XLV","XLI","XLY","XLU","XLB","XLC","XBI","SMH","SOXX"]

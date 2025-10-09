@@ -118,19 +118,52 @@ def fetch_indicators(df):
 # ----------------------------------------------------------------------
 
 def fetch_emas_and_filters(symbol):
-    """Download data and compute indicators."""
-    df_daily = yf.download(symbol, period="120d", interval=TIMEFRAME_DAILY, progress=False)
-    df_4h    = yf.download(symbol, period="180d", interval=TIMEFRAME_4H, progress=False)
+    """Download data and compute indicators safely."""
+    try:
+        df_daily = yf.download(
+            symbol,
+            period="120d",
+            interval=TIMEFRAME_DAILY,
+            progress=False,
+            auto_adjust=False,
+            threads=False
+        )
 
-    if len(df_daily) < 50 or len(df_4h) < 200:
-        raise ValueError("Insufficient data")
+        df_4h = yf.download(
+            symbol,
+            period="180d",
+            interval=TIMEFRAME_4H,
+            progress=False,
+            auto_adjust=False,
+            threads=False
+        )
 
-    df_daily = fetch_indicators(df_daily)
-    df_daily["ema_fast"] = df_daily["Close"].ewm(span=EMA_FAST).mean()
-    df_daily["ema_slow"] = df_daily["Close"].ewm(span=EMA_SLOW).mean()
-    df_4h["ema_trend"]   = df_4h["Close"].ewm(span=EMA_TREND).mean()
-    ema_trend = float(df_4h["ema_trend"].iloc[-1])
-    return df_daily, ema_trend
+        # Flatten possible MultiIndex columns
+        if isinstance(df_daily.columns, pd.MultiIndex):
+            df_daily.columns = [col[0] for col in df_daily.columns]
+        if isinstance(df_4h.columns, pd.MultiIndex):
+            df_4h.columns = [col[0] for col in df_4h.columns]
+
+        # Convert to 1D numpy arrays (avoid ndarray issues)
+        for col in ["Open", "High", "Low", "Close", "Volume"]:
+            if col in df_daily and isinstance(df_daily[col].iloc[0], (np.ndarray, list)):
+                df_daily[col] = df_daily[col].apply(lambda x: x[0] if isinstance(x, (list, np.ndarray)) else x)
+            if col in df_4h and isinstance(df_4h[col].iloc[0], (np.ndarray, list)):
+                df_4h[col] = df_4h[col].apply(lambda x: x[0] if isinstance(x, (list, np.ndarray)) else x)
+
+        if len(df_daily) < 50 or len(df_4h) < 200:
+            raise ValueError("Insufficient data")
+
+        df_daily = fetch_indicators(df_daily)
+        df_daily["ema_fast"] = df_daily["Close"].ewm(span=EMA_FAST).mean()
+        df_daily["ema_slow"] = df_daily["Close"].ewm(span=EMA_SLOW).mean()
+        df_4h["ema_trend"]   = df_4h["Close"].ewm(span=EMA_TREND).mean()
+
+        ema_trend = float(df_4h["ema_trend"].iloc[-1])
+        return df_daily, ema_trend
+
+    except Exception as e:
+        raise ValueError(f"{symbol}: {e}")
 
 def scan_tickers(tickers):
     """Main scanner with filters."""

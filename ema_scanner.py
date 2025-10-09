@@ -110,13 +110,19 @@ def get_nasdaq100_tickers():
 def get_dow30_tickers():
     try:
         tables = safe_read_html("https://en.wikipedia.org/wiki/Dow_Jones_Industrial_Average")
-        df = tables[1]
-        tickers = df["Symbol"].dropna().tolist()
-        logging.info(f"Loaded {len(tickers)} Dow 30 tickers from Wikipedia.")
-        return tickers
+        # Find table with ticker symbols (the second or third table typically)
+        for t in tables:
+            cols = [c.lower() for c in t.columns.astype(str)]
+            possible_cols = [c for c in cols if "symbol" in c or "ticker" in c]
+            if possible_cols:
+                tickers = t[t.columns[cols.index(possible_cols[0])]].dropna().astype(str).tolist()
+                logging.info(f"Loaded {len(tickers)} Dow 30 tickers from Wikipedia.")
+                return tickers
+        raise ValueError("No symbol/ticker column found.")
     except Exception as e:
         logging.error(f"Dow30 fetch failed: {e}")
-        return ["AAPL","MSFT","CAT","BA","JNJ","PG","V"]
+        return ["AAPL", "MSFT", "CAT", "BA", "JNJ", "PG", "V"]
+
 
 
 def get_sector_tickers():

@@ -1,9 +1,9 @@
 # ============================================================
-#             EMA Scanner Bot — Render Worker Edition
+#         EMA Multi-Factor Scanner Bot — Pro Edition
 # ============================================================
-# Scans S&P 500 + Top Biotech stocks
-# Sends Discord alerts for confirmed EMA (13/21) crossovers
-# Uses 4H EMA 200 trend filter + daily bar confirmation
+# Scans S&P500 + NASDAQ100 + Dow30 + Biotech + Sector ETFs
+# Sends Discord alerts for confirmed EMA(13/21) crossovers
+# Uses 4H EMA200 trend filter + RSI/ADX/OBV/ATR confirmations
 # Includes 5-day backtest performance summary
 # ============================================================
 
@@ -16,12 +16,16 @@ import logging
 import os
 import pytz
 from io import StringIO
+import ta
+import numpy as np
+from flask import Flask
+from threading import Thread
 
 # ----------------------------------------------------------------------
 # Configuration
 # ----------------------------------------------------------------------
 
-DISCORD_WEBHOOK = "https://discord.com/api/webhooks/1425616478601871400/AMbiCffNSI7lOsqLPBZ5UDPOStNW0UgcAJAqMU0D1QxDzD2EymlnrbTQxN44XErNkaXm"
+DISCORD_WEBHOOK = "https://discord.com/api/webhooks/REPLACE_WITH_YOUR_WEBHOOK"
 
 EMA_FAST = 13
 EMA_SLOW = 21
@@ -29,15 +33,17 @@ EMA_TREND = 200
 
 TIMEFRAME_DAILY = "1d"
 TIMEFRAME_4H = "4h"
-CHECK_INTERVAL = 900  # seconds (15 min)
+CHECK_INTERVAL = 900  # 15 minutes
 HOLD_DAYS = 5
 CAPITAL_PER_TRADE = 500
 LOG_FILE = "trades_log.csv"
 
 # Setup logging
-logging.basicConfig(level=logging.INFO,
-                    format="%(asctime)s - %(message)s",
-                    datefmt="%Y-%m-%d %H:%M")
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s - %(message)s",
+    datefmt="%Y-%m-%d %H:%M"
+)
 
 # ----------------------------------------------------------------------
 # Helper utilities
@@ -54,108 +60,113 @@ def send_discord_message(content: str):
     except Exception as e:
         logging.error(f"❌ Discord send failed: {e}")
 
+# ----------------------------------------------------------------------
+# Ticker universe fetchers
+# ----------------------------------------------------------------------
+
 def get_sp500_tickers():
-    """Fetch S&P 500 tickers from Wikipedia (fallback to static list)."""
     try:
-        import urllib.request
-        html = urllib.request.urlopen("https://en.wikipedia.org/wiki/List_of_S%26P_500_companies").read()
-        tables = pd.read_html(StringIO(html.decode()))
-        df = tables[0]
-        tickers = df["Symbol"].tolist()
-        logging.info(f"Loaded {len(tickers)} S&P 500 tickers from Wikipedia.")
-        return tickers
+        html = pd.read_html("https://en.wikipedia.org/wiki/List_of_S%26P_500_companies")
+        df = html[0]
+        return df["Symbol"].tolist()
     except Exception as e:
-        logging.error(f"Error loading S&P 500 list: {e}")
-        # fallback minimal list
+        logging.error(f"S&P500 fetch failed: {e}")
         return ["AAPL", "MSFT", "TSLA", "NVDA", "AMZN", "GOOG", "META"]
 
 def get_biotech_tickers():
-    """Fetch top biotech tickers (fallback static)."""
     try:
         bio = pd.read_html("https://en.wikipedia.org/wiki/List_of_biotechnology_companies")[0]
-        tickers = bio.iloc[:,0].dropna().tolist()[:100]
-        logging.info(f"Loaded {len(tickers)} biotech tickers from Wikipedia.")
+        tickers = bio.iloc[:, 0].dropna().tolist()[:100]
         return tickers
     except Exception as e:
-        logging.error(f"Error loading biotech list: {e}")
-        return ["BIIB", "REGN", "VRTX", "GILD", "ALNY", "ILMN", "CRSP", "EXEL", "BMRN", "SGEN",
-                "NBIX", "TECH", "HALO", "ARGX", "RGEN", "UTHR", "IONS", "GMAB", "INCY", "BLUE",
-                "SRPT", "ACAD", "PBYI", "PRTA", "MDGL", "MRTX", "CYT", "AGEN", "VCYT", "EVGN"]
+        logging.error(f"Biotech list error: {e}")
+        return ["BIIB", "REGN", "VRTX", "GILD", "ALNY", "ILMN"]
+
+def get_nasdaq100_tickers():
+    try:
+        t = pd.read_html("https://en.wikipedia.org/wiki/NASDAQ-100")[4]
+        return t["Ticker"].dropna().tolist()
+    except Exception:
+        return ["AAPL", "MSFT", "NVDA", "META", "AMZN", "GOOG", "TSLA"]
+
+def get_dow30_tickers():
+    try:
+        t = pd.read_html("https://en.wikipedia.org/wiki/Dow_Jones_Industrial_Average")[1]
+        return t["Symbol"].dropna().tolist()
+    except Exception:
+        return ["AAPL", "MSFT", "CAT", "BA", "JNJ", "PG", "V"]
+
+def get_sector_tickers():
+    return ["XLE","XLF","XLK","XLV","XLI","XLY","XLU","XLB","XLC","XBI","SMH","SOXX"]
 
 # ----------------------------------------------------------------------
-# Core EMA Scanner
+# Technical indicator helpers
 # ----------------------------------------------------------------------
 
-def fetch_emas(symbol):
-    """Return EMAs (13, 21 daily; 200 on 4h) and latest Close for both live and confirmed modes."""
-    df_daily = yf.download(symbol, period="60d", interval=TIMEFRAME_DAILY, progress=False)
+def fetch_indicators(df):
+    """Add RSI, ADX, OBV, ATR columns."""
+    df["rsi"] = ta.momentum.RSIIndicator(df["Close"], window=14).rsi()
+    adx = ta.trend.ADXIndicator(df["High"], df["Low"], df["Close"], window=14)
+    df["adx"] = adx.adx()
+    obv = ta.volume.OnBalanceVolumeIndicator(df["Close"], df["Volume"])
+    df["obv"] = obv.on_balance_volume()
+    df["atr"] = ta.volatility.AverageTrueRange(df["High"], df["Low"], df["Close"], window=14).average_true_range()
+    return df
+
+# ----------------------------------------------------------------------
+# Core EMA + multi-factor logic
+# ----------------------------------------------------------------------
+
+def fetch_emas_and_filters(symbol):
+    """Download data and compute indicators."""
+    df_daily = yf.download(symbol, period="120d", interval=TIMEFRAME_DAILY, progress=False)
     df_4h    = yf.download(symbol, period="180d", interval=TIMEFRAME_4H, progress=False)
 
-    if len(df_daily) < 21 or len(df_4h) < 200:
+    if len(df_daily) < 50 or len(df_4h) < 200:
         raise ValueError("Insufficient data")
 
+    df_daily = fetch_indicators(df_daily)
     df_daily["ema_fast"] = df_daily["Close"].ewm(span=EMA_FAST).mean()
     df_daily["ema_slow"] = df_daily["Close"].ewm(span=EMA_SLOW).mean()
     df_4h["ema_trend"]   = df_4h["Close"].ewm(span=EMA_TREND).mean()
-
-    # --- Live (in-progress) data ---
-    live_close = float(df_daily["Close"].iloc[-1])
-    live_fast  = float(df_daily["ema_fast"].iloc[-1])
-    live_slow  = float(df_daily["ema_slow"].iloc[-1])
-    prev_fast_live = float(df_daily["ema_fast"].iloc[-2])
-    prev_slow_live = float(df_daily["ema_slow"].iloc[-2])
-
-    # --- Confirmed (fully closed) data ---
-    conf_close = float(df_daily["Close"].iloc[-2])
-    conf_fast  = float(df_daily["ema_fast"].iloc[-2])
-    conf_slow  = float(df_daily["ema_slow"].iloc[-2])
-    prev_fast_conf = float(df_daily["ema_fast"].iloc[-3])
-    prev_slow_conf = float(df_daily["ema_slow"].iloc[-3])
-
     ema_trend = float(df_4h["ema_trend"].iloc[-1])
-
-    return {
-        "live":  (prev_fast_live, prev_slow_live, live_fast, live_slow, ema_trend, live_close),
-        "confirm": (prev_fast_conf, prev_slow_conf, conf_fast, conf_slow, ema_trend, conf_close)
-    }
-
+    return df_daily, ema_trend
 
 def scan_tickers(tickers):
-    """Check all tickers for EMA crossovers in both live and confirmed modes."""
-    live_signals = []
+    """Main scanner with filters."""
     conf_signals = []
-
     for sym in tickers:
         try:
-            data = fetch_emas(sym)
-            for mode_name, (prev_fast, prev_slow, ema_fast, ema_slow, ema_trend, close) in data.items():
-                crossed_up   = prev_fast < prev_slow and ema_fast > ema_slow
-                crossed_down = prev_fast > prev_slow and ema_fast < ema_slow
-                is_above_trend = close > ema_trend
-                is_below_trend = close < ema_trend
+            df, ema_trend = fetch_emas_and_filters(sym)
+            prev_fast, prev_slow = df["ema_fast"].iloc[-2], df["ema_slow"].iloc[-2]
+            ema_fast,  ema_slow  = df["ema_fast"].iloc[-1], df["ema_slow"].iloc[-1]
+            close = df["Close"].iloc[-1]
+            rsi, adx = df["rsi"].iloc[-1], df["adx"].iloc[-1]
+            atr, atr_mean = df["atr"].iloc[-1], df["atr"].rolling(100).mean().iloc[-1]
+            obv = df["obv"]
 
-                # Build messages
-                if crossed_up and is_above_trend:
-                    msg = f"📈 {sym} BUY @ {close:.2f} (Daily EMA13>EMA21 & above 4H EMA200)"
-                    if mode_name == "live":
-                        live_signals.append(msg)
-                    else:
-                        conf_signals.append(msg)
-                        record_signal("BUY", sym, close)
+            crossed_up   = prev_fast < prev_slow and ema_fast > ema_slow
+            crossed_down = prev_fast > prev_slow and ema_fast < ema_slow
+            is_above_trend = close > ema_trend
+            is_below_trend = close < ema_trend
+            obv_rising = obv.iloc[-1] > obv.iloc[-5] if len(obv) > 5 else True
 
-                elif crossed_down and is_below_trend:
-                    msg = f"🔻 {sym} SELL @ {close:.2f} (Daily EMA13<EMA21 & below 4H EMA200)"
-                    if mode_name == "live":
-                        live_signals.append(msg)
-                    else:
-                        conf_signals.append(msg)
-                        record_signal("SELL", sym, close)
+            # --- Long confirmation ---
+            if crossed_up and is_above_trend and rsi > 55 and adx > 20 and atr > 0.8*atr_mean and obv_rising:
+                msg = f"📈 {sym} BUY @ {close:.2f} | RSI {rsi:.1f}, ADX {adx:.1f}"
+                conf_signals.append(msg)
+                record_signal("BUY", sym, close)
+
+            # --- Short confirmation ---
+            elif crossed_down and is_below_trend and rsi < 45 and adx > 20 and atr > 0.8*atr_mean and not obv_rising:
+                msg = f"🔻 {sym} SELL @ {close:.2f} | RSI {rsi:.1f}, ADX {adx:.1f}"
+                conf_signals.append(msg)
+                record_signal("SELL", sym, close)
 
         except Exception as e:
-            logging.error(f"Error scanning {sym}: {e}")
+            logging.error(f"{sym}: {e}")
 
-    return live_signals, conf_signals
-
+    return conf_signals
 
 # ----------------------------------------------------------------------
 # Backtest Tracker
@@ -195,7 +206,7 @@ def evaluate_old_signals():
             profit = ret * CAPITAL_PER_TRADE
             results.append((sym, side, entry, exit_price, profit))
         except Exception as e:
-            logging.error(f"Error evaluating {sym}: {e}")
+            logging.error(f"Backtest {sym}: {e}")
 
     if not results: return None
 
@@ -218,24 +229,23 @@ def evaluate_old_signals():
 # ----------------------------------------------------------------------
 
 def main():
-    sp500 = get_sp500_tickers()
-    bio = get_biotech_tickers()
-    tickers = sorted(set(sp500 + bio))
+    tickers = sorted(set(
+        get_sp500_tickers() +
+        get_biotech_tickers() +
+        get_nasdaq100_tickers() +
+        get_dow30_tickers() +
+        get_sector_tickers()
+    ))
     logging.info(f"Total tickers to scan: {len(tickers)}")
-    logging.info("🚀 EMA Scanner Bot Started — hybrid mode enabled (LIVE + CONFIRMED)")
+    logging.info("🚀 EMA Multi-Factor Scanner Started")
 
     while True:
-        live_signals, conf_signals = scan_tickers(tickers)
-
-        if live_signals:
-            msg = f"**⚡ EMA Cross Alerts — LIVE ({datetime.datetime.now():%Y-%m-%d %H:%M})**\n" + "\n".join(live_signals)
-            send_discord_message(msg)
+        conf_signals = scan_tickers(tickers)
 
         if conf_signals:
-            msg = f"**✅ EMA Cross Alerts — CONFIRMED ({datetime.datetime.now():%Y-%m-%d %H:%M})**\n" + "\n".join(conf_signals)
+            msg = f"**✅ EMA Multi-Factor Alerts ({datetime.datetime.now():%Y-%m-%d %H:%M})**\n" + "\n".join(conf_signals)
             send_discord_message(msg)
-
-        if not live_signals and not conf_signals:
+        else:
             logging.info(f"{datetime.datetime.now():%H:%M} — No signals")
 
         report = evaluate_old_signals()
@@ -243,12 +253,10 @@ def main():
             send_discord_message(report)
 
         time.sleep(CHECK_INTERVAL)
-      
+
 # ----------------------------------------------------------------------
-# FAKE WEB SERVER (to keep Render Free Web Service alive)
+# Flask server to keep Render alive
 # ----------------------------------------------------------------------
-from threading import Thread
-from flask import Flask
 
 app = Flask(__name__)
 
@@ -257,20 +265,8 @@ def home():
     return "EMA Scanner running."
 
 def run_flask():
-    # Default Render port env var
     port = int(os.environ.get("PORT", 10000))
     app.run(host="0.0.0.0", port=port)
-
-# ----------------------------------------------------------------------
-# Entrypoint (start both Flask + bot)
-# ----------------------------------------------------------------------
-if __name__ == "__main__":
-    try:
-        # Start Flask in a background thread
-        Thread(target=run_flask, daemon=True).start()
-        main()
-    except Exception as e:
-        logging.error(f"Fatal error: {e}")
 
 # ----------------------------------------------------------------------
 # Entrypoint
@@ -278,6 +274,7 @@ if __name__ == "__main__":
 
 if __name__ == "__main__":
     try:
+        Thread(target=run_flask, daemon=True).start()
         main()
     except Exception as e:
         logging.error(f"Fatal error: {e}")

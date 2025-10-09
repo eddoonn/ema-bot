@@ -4,3 +4,5 @@ requests
 pytz
 lxml
 html5lib
+ta
+flask

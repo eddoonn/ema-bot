@@ -10,7 +10,6 @@
 import re
 import os
 import ta
-import pytz
 import time
 import logging
 import datetime
@@ -24,12 +23,13 @@ import requests
 
 from flask import Flask
 from threading import Thread
+from pandas.api.types import is_numeric_dtype
 
 # ----------------------------------------------------------------------
 # Configuration
 # ----------------------------------------------------------------------
 
-DISCORD_WEBHOOK = os.getenv("DISCORD_WEBHOOK", "https://discord.com/api/webhooks/1425616478601871400/AMbiCffNSI7lOsqLPBZ5UDPOStNW0UgcAJAqMU0D1QxDzD2EymlnrbTQxN44XErNkaXm")
+DISCORD_WEBHOOK = os.getenv("DISCORD_WEBHOOK", "https://discord.com/api/webhooks/REPLACE_WITH_YOUR_WEBHOOK")
 
 EMA_FAST = int(os.getenv("EMA_FAST", 13))
 EMA_SLOW = int(os.getenv("EMA_SLOW", 21))
@@ -43,21 +43,18 @@ HOLD_DAYS = int(os.getenv("HOLD_DAYS", 5))
 CAPITAL_PER_TRADE = float(os.getenv("CAPITAL_PER_TRADE", 500))
 LOG_FILE = os.getenv("LOG_FILE", "trades_log.csv")
 
-# Setup logging
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s - %(message)s",
     datefmt="%Y-%m-%d %H:%M"
 )
-
 logger = logging.getLogger(__name__)
 
 # ----------------------------------------------------------------------
-# Helper utilities
+# Helpers
 # ----------------------------------------------------------------------
 
 def send_discord_message(content: str):
-    """Send a message to Discord webhook."""
     if (not DISCORD_WEBHOOK) or ("REPLACE_WITH_YOUR_WEBHOOK" in DISCORD_WEBHOOK):
         logging.warning("⚠️ No valid webhook URL configured — alert not sent.")
         return
@@ -71,7 +68,6 @@ def send_discord_message(content: str):
         logging.error(f"❌ Discord send failed: {e}")
 
 def to_float(x):
-    """Safely convert anything to float or NaN."""
     try:
         if isinstance(x, (list, np.ndarray)) and len(x) > 0:
             x = x[0]
@@ -80,14 +76,6 @@ def to_float(x):
         return np.nan
 
 def _normalize_ticker(x):
-    """
-    Convert scraped value to a clean Yahoo Finance-style ticker or None to drop.
-    - trims
-    - uppercases
-    - keeps first token
-    - converts dots to dashes (BRK.B -> BRK-B)
-    - validates against simple pattern
-    """
     if x is None:
         return None
     s = str(x).strip().upper()
@@ -95,7 +83,6 @@ def _normalize_ticker(x):
         return None
     s = s.split()[0]
     s = s.replace(".", "-")
-    # basic validation: letters/dashes only; adjust length as needed
     if not re.fullmatch(r"[A-Z\-]+", s):
         return None
     if len(s) > 12:
@@ -111,7 +98,6 @@ def normalize_tickers(seq):
     return out
 
 def safe_read_html(url):
-    """Fetch HTML with custom User-Agent to avoid 403 and return DataFrames."""
     headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
     req = urllib.request.Request(url, headers=headers)
     with urllib.request.urlopen(req, timeout=20) as resp:
@@ -119,7 +105,7 @@ def safe_read_html(url):
     return pd.read_html(html)
 
 # ----------------------------------------------------------------------
-# Ticker universe fetchers
+# Ticker universes
 # ----------------------------------------------------------------------
 
 def get_sp500_tickers():
@@ -147,14 +133,13 @@ def get_biotech_tickers():
 def get_nasdaq100_tickers():
     try:
         tables = safe_read_html("https://en.wikipedia.org/wiki/NASDAQ-100")
-        # Table indices can change; try to find a 'Ticker' column
         df = None
         for t in tables:
             if "Ticker" in t.columns:
                 df = t
                 break
         if df is None:
-            df = tables[4]  # fallback to historical index
+            df = tables[4]
         tickers = df["Ticker"].dropna().astype(str).tolist()
         logging.info(f"Loaded {len(tickers)} NASDAQ-100 tickers from Wikipedia.")
         return tickers
@@ -178,15 +163,13 @@ def get_dow30_tickers():
         return ["AAPL", "MSFT", "CAT", "BA", "JNJ", "PG", "V"]
 
 def get_sector_tickers():
-    # Add/adjust ETFs as needed
     return ["XLE","XLF","XLK","XLV","XLI","XLY","XLU","XLB","XLC","XBI","SMH","SOXX"]
 
 # ----------------------------------------------------------------------
-# Technical indicator helpers
+# Indicators
 # ----------------------------------------------------------------------
 
 def fetch_indicators(df: pd.DataFrame) -> pd.DataFrame:
-    """Add RSI, ADX, OBV, ATR columns."""
     df = df.copy()
     df["rsi"] = ta.momentum.RSIIndicator(df["Close"], window=14).rsi()
     adx = ta.trend.ADXIndicator(df["High"], df["Low"], df["Close"], window=14)
@@ -196,10 +179,6 @@ def fetch_indicators(df: pd.DataFrame) -> pd.DataFrame:
     atr = ta.volatility.AverageTrueRange(df["High"], df["Low"], df["Close"], window=14)
     df["atr"] = atr.average_true_range()
     return df
-
-# ----------------------------------------------------------------------
-# Core EMA + multi-factor logic
-# ----------------------------------------------------------------------
 
 def _ensure_flat_columns(df: pd.DataFrame) -> pd.DataFrame:
     if isinstance(df.columns, pd.MultiIndex):
@@ -218,8 +197,11 @@ def _to_numeric_cols(df: pd.DataFrame, cols):
             df[c] = pd.to_numeric(df[c], errors="coerce")
     return df
 
+# ----------------------------------------------------------------------
+# Data fetch + EMA logic
+# ----------------------------------------------------------------------
+
 def fetch_emas_and_filters(symbol: str):
-    """Download data and compute indicators safely."""
     try:
         df_daily = yf.download(
             symbol, period="120d", interval=TIMEFRAME_DAILY,
@@ -230,29 +212,22 @@ def fetch_emas_and_filters(symbol: str):
             progress=False, auto_adjust=False, threads=False
         )
 
-        # Early emptiness checks
         if df_daily is None or df_daily.empty or df_4h is None or df_4h.empty:
             raise ValueError("No data returned")
 
-        # Flatten potential multi-index columns
         df_daily = _ensure_flat_columns(df_daily)
         df_4h = _ensure_flat_columns(df_4h)
 
-        # Unbox array-like cells if any
         cols = ["Open", "High", "Low", "Close", "Volume"]
         df_daily = _unbox_arraylike_cells(df_daily, cols)
         df_4h = _unbox_arraylike_cells(df_4h, cols)
 
-        # Basic length checks
         if len(df_daily) < max(EMA_SLOW, 50) or len(df_4h) < max(EMA_TREND, 200):
             raise ValueError("Insufficient data")
 
-        # Coerce numerics
-        price_cols = ["Open", "High", "Low", "Close", "Volume"]
-        df_daily = _to_numeric_cols(df_daily, price_cols)
-        df_4h = _to_numeric_cols(df_4h, price_cols)
+        df_daily = _to_numeric_cols(df_daily, cols)
+        df_4h = _to_numeric_cols(df_4h, cols)
 
-        # Indicators
         df_daily = fetch_indicators(df_daily)
         df_daily["ema_fast"] = df_daily["Close"].ewm(span=EMA_FAST, adjust=False).mean()
         df_daily["ema_slow"] = df_daily["Close"].ewm(span=EMA_SLOW, adjust=False).mean()
@@ -269,17 +244,18 @@ def fetch_emas_and_filters(symbol: str):
 # ----------------------------------------------------------------------
 
 def scan_tickers(tickers):
-    """Main scanner with full numeric safety and indicator filters."""
     conf_signals = []
 
     for sym in tickers:
         try:
             df, ema_trend = fetch_emas_and_filters(sym)
 
-            # Coerce all numeric-like columns to float
+            # Convert non-numeric columns when possible (no deprecated errors="ignore")
             for col in df.columns:
+                if is_numeric_dtype(df[col]):
+                    continue
                 try:
-                    df[col] = pd.to_numeric(df[col], errors="ignore")
+                    df[col] = pd.to_numeric(df[col])
                 except Exception:
                     pass
 
@@ -301,28 +277,16 @@ def scan_tickers(tickers):
                 logging.debug(f"Skipping {sym}: NaN or invalid numeric data.")
                 continue
 
-            # Safe comparisons
-            try:
-                crossed_up     = (prev_fast < prev_slow) and (ema_fast > ema_slow)
-                crossed_down   = (prev_fast > prev_slow) and (ema_fast < ema_slow)
-                is_above_trend = (close > ema_trend)
-                is_below_trend = (close < ema_trend)
-            except Exception as e:
-                logging.error(
-                    f"Comparison error for {sym}: {e} | "
-                    f"prev_fast={prev_fast} ({type(prev_fast)}), prev_slow={prev_slow} ({type(prev_slow)}), "
-                    f"ema_fast={ema_fast} ({type(ema_fast)}), ema_slow={ema_slow} ({type(ema_slow)}), "
-                    f"close={close} ({type(close)}), ema_trend={ema_trend} ({type(ema_trend)})"
-                )
-                continue
+            crossed_up     = (prev_fast < prev_slow) and (ema_fast > ema_slow)
+            crossed_down   = (prev_fast > prev_slow) and (ema_fast < ema_slow)
+            is_above_trend = (close > ema_trend)
+            is_below_trend = (close < ema_trend)
 
-            # OBV trend
             try:
                 obv_rising = float(obv.iloc[-1]) > float(obv.iloc[-5]) if len(obv) > 5 else True
             except Exception:
                 obv_rising = True
 
-            # Multi-factor filter
             if crossed_up and is_above_trend and rsi > 55 and adx > 20 and atr > 0.8 * atr_mean and obv_rising:
                 msg = f"📈 {sym} BUY @ {close:.2f} | RSI {rsi:.1f}, ADX {adx:.1f}"
                 conf_signals.append(msg)
@@ -339,7 +303,7 @@ def scan_tickers(tickers):
     return conf_signals
 
 # ----------------------------------------------------------------------
-# Backtest Tracker
+# Backtest
 # ----------------------------------------------------------------------
 
 def record_signal(signal_type, sym, price):
@@ -364,7 +328,6 @@ def evaluate_old_signals():
     if df.empty:
         return None
 
-    # Types
     try:
         df["date"] = pd.to_datetime(df["date"], errors="coerce")
         df["price"] = pd.to_numeric(df["price"], errors="coerce")
@@ -409,7 +372,6 @@ def evaluate_old_signals():
         msg += f"{emoji} {sym} {side} {entry:.2f} → {exitp:.2f} | {prof:+.2f} USD\n"
     msg += f"\n**Total:** {total:+.2f} USD | **Winrate:** {winrate:.1f}% | **Avg:** {avg_trade:+.2f} USD/trade"
 
-    # remove evaluated rows
     df_remaining = df[~df["symbol"].isin([r[0] for r in results])]
     try:
         df_remaining.to_csv(LOG_FILE, index=False)
@@ -419,7 +381,7 @@ def evaluate_old_signals():
     return msg
 
 # ----------------------------------------------------------------------
-# Main Loop
+# Main
 # ----------------------------------------------------------------------
 
 def _build_universe():
@@ -458,14 +420,13 @@ def main():
                 send_discord_message(report)
 
         except Exception as e:
-            # Catch any uncaught exceptions and include the traceback
             logging.error(f"⚠️ Global loop error: {type(e).__name__} — {e}")
             traceback.print_exc()
 
         time.sleep(CHECK_INTERVAL)
 
 # ----------------------------------------------------------------------
-# Flask server to keep Render alive
+# Flask (keep-alive)
 # ----------------------------------------------------------------------
 
 app = Flask(__name__)
@@ -476,7 +437,6 @@ def home():
 
 def run_flask():
     port = int(os.environ.get("PORT", 10000))
-    # Production note: Use a production WSGI server for real deployments
     app.run(host="0.0.0.0", port=port)
 
 # ----------------------------------------------------------------------

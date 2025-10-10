@@ -47,6 +47,24 @@ HOLD_DAYS          = int(os.getenv("HOLD_DAYS", 5))
 CAPITAL_PER_TRADE  = float(os.getenv("CAPITAL_PER_TRADE", 500))
 LOG_FILE           = os.getenv("LOG_FILE", "trades_log.csv")
 
+# ---- Confirmation scoring tunables (for "any 2 of 3") ----
+# You can override these in Render → Environment
+RSI_MIN_BUY   = float(os.getenv("RSI_MIN_BUY", 50))    # default 50 (was 55)
+RSI_MAX_SELL  = float(os.getenv("RSI_MAX_SELL", 50))   # default 50 (was 45; 48–50 is common)
+ADX_MIN       = float(os.getenv("ADX_MIN", 15))        # default 15 (was 20)
+ATR_RATIO_MIN = float(os.getenv("ATR_RATIO_MIN", 0.7)) # default 0.7 (was 0.8)
+
+# Allow a small buffer around the 4h EMA200 trend
+TREND_BUF     = float(os.getenv("TREND_BUF", 0.99))    # 0.99 ≈ allow ~1% below for buys
+
+# Require "any N of 3" confirmations (RSI, ADX, ATR)
+CONFIRM_SCORE_BUY  = int(os.getenv("CONFIRM_SCORE_BUY", 2))
+CONFIRM_SCORE_SELL = int(os.getenv("CONFIRM_SCORE_SELL", 2))
+
+# Optional: count OBV as an extra vote (False by default)
+USE_OBV = os.getenv("USE_OBV", "0") == "1"
+
+
 # scanning cadence
 SCAN_BATCH_SIZE    = int(os.getenv("SCAN_BATCH_SIZE", 150))       # tickers per rotating batch
 BATCHES_PER_LOOP   = int(os.getenv("BATCHES_PER_LOOP", 1))        # how many batches per loop
@@ -328,7 +346,9 @@ def _extract_ema_trend(df_4h: pd.DataFrame) -> float:
         return np.nan
 
 def _compute_signal_for_df(df_daily: pd.DataFrame, ema_trend_value: float):
-    # Convert non-numeric columns where applicable
+    from pandas.api.types import is_numeric_dtype
+
+    # Ensure numeric
     for col in df_daily.columns:
         if is_numeric_dtype(df_daily[col]):
             continue
@@ -354,20 +374,39 @@ def _compute_signal_for_df(df_daily: pd.DataFrame, ema_trend_value: float):
     if any(pd.isna(v) or (isinstance(v, float) and np.isnan(v)) for v in vals):
         return None
 
+    # Must-haves
     crossed_up     = (prev_fast < prev_slow) and (ema_fast > ema_slow)
     crossed_down   = (prev_fast > prev_slow) and (ema_fast < ema_slow)
-    is_above_trend = (close > ema_trend_value)
-    is_below_trend = (close < ema_trend_value)
+    is_above_trend = (close > ema_trend_value * TREND_BUF)
+    is_below_trend = (close < ema_trend_value / TREND_BUF)
 
+    # Optional OBV vote
     try:
-        obv_rising = float(df_daily["obv"].iloc[-1]) > float(df_daily["obv"].iloc[-5]) if len(df_daily["obv"]) > 5 else True
+        obv = df_daily["obv"]
+        obv_rising  = float(obv.iloc[-1]) > float(obv.iloc[-5]) if len(obv) > 5 else True
+        obv_falling = float(obv.iloc[-1]) < float(obv.iloc[-5]) if len(obv) > 5 else True
     except Exception:
-        obv_rising = True
+        obv_rising = obv_falling = True
 
-    if crossed_up and is_above_trend and rsi > 55 and adx > 20 and atr > 0.8 * atr_mean and obv_rising:
+    # Build 2-of-3 scores (RSI, ADX, ATR). OBV is optional extra vote.
+    buy_score = 0
+    buy_score += 1 if rsi > RSI_MIN_BUY else 0
+    buy_score += 1 if adx > ADX_MIN else 0
+    buy_score += 1 if atr > ATR_RATIO_MIN * atr_mean else 0
+    if USE_OBV and obv_rising:
+        buy_score += 1
+
+    sell_score = 0
+    sell_score += 1 if rsi < RSI_MAX_SELL else 0
+    sell_score += 1 if adx > ADX_MIN else 0
+    sell_score += 1 if atr > ATR_RATIO_MIN * atr_mean else 0
+    if USE_OBV and obv_falling:
+        sell_score += 1
+
+    if crossed_up and is_above_trend and buy_score >= CONFIRM_SCORE_BUY:
         return ("BUY", close, rsi, adx)
 
-    if crossed_down and is_below_trend and rsi < 45 and adx > 20 and atr > 0.8 * atr_mean and not obv_rising:
+    if crossed_down and is_below_trend and sell_score >= CONFIRM_SCORE_SELL:
         return ("SELL", close, rsi, adx)
 
     return None
@@ -402,7 +441,10 @@ def scan_tickers_batched(tickers, *, offset=0, batch_size=SCAN_BATCH_SIZE):
         "last_error": None,
     })
 
-    logging.info(f"Scanning {len(batch)} tickers (batch {start}->{(end-1)%n})")
+    logging.info(
+    f"After this batch: next_offset={next_offset} "
+    f"(~{(next_offset / n) * 100.0:.1f}% of universe covered)"
+)
 
     # Chunked batch downloads
     try:

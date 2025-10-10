@@ -42,7 +42,7 @@ EMA_TREND = int(os.getenv("EMA_TREND", 200))
 TIMEFRAME_DAILY = os.getenv("TIMEFRAME_DAILY", "1d")
 TIMEFRAME_4H    = os.getenv("TIMEFRAME_4H", "4h")
 
-CHECK_INTERVAL     = int(os.getenv("CHECK_INTERVAL", 900))       # sleep between loops
+CHECK_INTERVAL     = int(os.getenv("CHECK_INTERVAL", 120))       # sleep between loops
 HOLD_DAYS          = int(os.getenv("HOLD_DAYS", 5))
 CAPITAL_PER_TRADE  = float(os.getenv("CAPITAL_PER_TRADE", 500))
 LOG_FILE           = os.getenv("LOG_FILE", "trades_log.csv")

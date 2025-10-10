@@ -5,32 +5,35 @@
 # Sends Discord alerts for confirmed EMA(13/21) crossovers
 # Uses 4H EMA200 trend filter + RSI/ADX/OBV/ATR confirmations
 # Includes 5-day backtest performance summary
+# Batched downloads to reduce Yahoo rate limits
 # ============================================================
 
-import re
 import os
-import ta
+import re
 import time
+import math
+import json
+import random
 import logging
 import datetime
 import traceback
-import random
 import urllib.request
+from threading import Thread
 
 import numpy as np
 import pandas as pd
 import yfinance as yf
 import requests
+import ta
 
-from flask import Flask
-from threading import Thread
+from flask import Flask, jsonify
 from pandas.api.types import is_numeric_dtype
 
 # ----------------------------------------------------------------------
-# Configuration
+# Configuration (override via env vars on Render)
 # ----------------------------------------------------------------------
 
-DISCORD_WEBHOOK = os.getenv("DISCORD_WEBHOOK", "https://discord.com/api/webhooks/1425616478601871400/AMbiCffNSI7lOsqLPBZ5UDPOStNW0UgcAJAqMU0D1QxDzD2EymlnrbTQxN44XErNkaXm")
+DISCORD_WEBHOOK = os.getenv("DISCORD_WEBHOOK", "https://discord.com/api/webhooks/REPLACE_WITH_YOUR_WEBHOOK")
 
 EMA_FAST  = int(os.getenv("EMA_FAST", 13))
 EMA_SLOW  = int(os.getenv("EMA_SLOW", 21))
@@ -39,24 +42,42 @@ EMA_TREND = int(os.getenv("EMA_TREND", 200))
 TIMEFRAME_DAILY = os.getenv("TIMEFRAME_DAILY", "1d")
 TIMEFRAME_4H    = os.getenv("TIMEFRAME_4H", "4h")
 
-CHECK_INTERVAL     = int(os.getenv("CHECK_INTERVAL", 900))    # seconds
+CHECK_INTERVAL     = int(os.getenv("CHECK_INTERVAL", 900))       # sleep between loops
 HOLD_DAYS          = int(os.getenv("HOLD_DAYS", 5))
 CAPITAL_PER_TRADE  = float(os.getenv("CAPITAL_PER_TRADE", 500))
 LOG_FILE           = os.getenv("LOG_FILE", "trades_log.csv")
 
-# Rate limiting / batching
-SCAN_BATCH_SIZE    = int(os.getenv("SCAN_BATCH_SIZE", 150))    # tickers per loop
-RATE_LIMIT_DELAY   = float(os.getenv("RATE_LIMIT_DELAY", 0.15))# seconds between symbols
+# scanning cadence
+SCAN_BATCH_SIZE    = int(os.getenv("SCAN_BATCH_SIZE", 150))       # tickers per batch
+BATCHES_PER_LOOP   = int(os.getenv("BATCHES_PER_LOOP", 1))        # how many batches each loop
+BATCH_PAUSE        = float(os.getenv("BATCH_PAUSE", 3.0))         # seconds between batches in the same loop
+
+# rate-limit/resiliency
 MAX_RETRIES        = int(os.getenv("MAX_RETRIES", 3))
 BACKOFF_BASE       = float(os.getenv("BACKOFF_BASE", 1.7))
 BACKOFF_JITTER_MAX = float(os.getenv("BACKOFF_JITTER_MAX", 0.35))
+RATE_LIMIT_DELAY   = float(os.getenv("RATE_LIMIT_DELAY", 0.0))    # small delay after each *batch* download
 
+# logging
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s - %(message)s",
     datefmt="%Y-%m-%d %H:%M"
 )
 logger = logging.getLogger(__name__)
+
+# ----------------------------------------------------------------------
+# Globals for health reporting
+# ----------------------------------------------------------------------
+
+LAST_SCAN_SUMMARY = {
+    "universe_size": 0,
+    "last_batch_start": None,
+    "last_batch_size": 0,
+    "signals_in_batch": 0,
+    "coverage_pct": 0.0,
+    "last_error": None,
+}
 
 # ----------------------------------------------------------------------
 # Helpers
@@ -90,7 +111,7 @@ def _normalize_ticker(x):
     if not s:
         return None
     s = s.split()[0]
-    s = s.replace(".", "-")  # BRK.B -> BRK-B
+    s = s.replace(".", "-")  # BRK.B -> BRK-B for Yahoo
     if not re.fullmatch(r"[A-Z\-]+", s):
         return None
     if len(s) > 12:
@@ -113,49 +134,11 @@ def safe_read_html(url):
     return pd.read_html(html)
 
 def _sleep_backoff(attempt: int):
-    # attempt: 0..MAX_RETRIES-1
     wait = (BACKOFF_BASE ** attempt) + random.random() * BACKOFF_JITTER_MAX
     time.sleep(wait)
 
-def yf_download_retry(ticker: str, *, period: str, interval: str, label: str):
-    """
-    Resilient wrapper over yf.download to soften Yahoo rate limits.
-    Returns DataFrame or raises after retries.
-    """
-    last_exc = None
-    for attempt in range(MAX_RETRIES):
-        try:
-            df = yf.download(
-                ticker,
-                period=period,
-                interval=interval,
-                progress=False,
-                auto_adjust=False,
-                threads=False
-            )
-            # Some rate-limit cases return empty frames silently
-            if df is not None and not df.empty:
-                return df
-            raise RuntimeError("Empty DataFrame (possibly rate-limited)")
-        except Exception as e:
-            last_exc = e
-            msg = str(e)
-            # Heuristics: YFRateLimitError or HTTP 429 or “Too Many Requests” -> backoff and retry
-            if any(s in msg for s in ["Rate limited", "Too Many Requests", "429", "rate-limit", "rate limited"]):
-                logging.warning(f"{ticker}: rate-limited during {label}. Backing off (attempt {attempt+1}/{MAX_RETRIES})...")
-                _sleep_backoff(attempt)
-                continue
-            # Other transient network errors: retry as well
-            if any(s in msg.lower() for s in ["timed out", "timeout", "temporary failure", "connection reset"]):
-                logging.warning(f"{ticker}: transient network error during {label}. Backing off (attempt {attempt+1}/{MAX_RETRIES})...")
-                _sleep_backoff(attempt)
-                continue
-            # Non-transient -> break early
-            break
-    raise last_exc if last_exc else RuntimeError("Unknown download error")
-
 # ----------------------------------------------------------------------
-# Ticker universes
+# Universe fetchers
 # ----------------------------------------------------------------------
 
 def get_sp500_tickers():
@@ -232,16 +215,59 @@ def fetch_indicators(df: pd.DataFrame) -> pd.DataFrame:
     df["atr"] = atr.average_true_range()
     return df
 
-def _ensure_flat_columns(df: pd.DataFrame) -> pd.DataFrame:
-    if isinstance(df.columns, pd.MultiIndex):
-        df.columns = [c[0] for c in df.columns]
-    return df
+# ----------------------------------------------------------------------
+# Batch downloads (multi-ticker) to reduce rate limits
+# ----------------------------------------------------------------------
 
-def _unbox_arraylike_cells(df: pd.DataFrame, cols):
-    for col in cols:
-        if col in df.columns and len(df[col]) > 0 and isinstance(df[col].iloc[0], (np.ndarray, list)):
-            df[col] = df[col].apply(lambda x: x[0] if isinstance(x, (list, np.ndarray)) and len(x) > 0 else x)
-    return df
+def _download_batch(tickers, *, period, interval, label):
+    """
+    One yf.download call for many tickers. Returns dict[ticker] -> DataFrame (or None).
+    Retries on rate-limit / transient errors.
+    """
+    last_exc = None
+    # yfinance returns MultiIndex columns when list provided
+    for attempt in range(MAX_RETRIES):
+        try:
+            df = yf.download(
+                tickers,
+                period=period,
+                interval=interval,
+                progress=False,
+                auto_adjust=False,
+                threads=False,
+                group_by='ticker'  # ensures top-level ticker columns
+            )
+            if isinstance(df, pd.DataFrame) and not df.empty:
+                out = {}
+                # If only ONE ticker got returned despite list, yfinance returns normal columns
+                if not isinstance(df.columns, pd.MultiIndex):
+                    # Unknown mapping — treat as undifferentiated; assign to first ticker only
+                    t = tickers[0] if tickers else None
+                    out[t] = df
+                else:
+                    # columns like: (TICKER, Open/High/Low/Close/Adj Close/Volume)
+                    for t in tickers:
+                        if t in df.columns.get_level_values(0):
+                            sub = df[t].dropna(how="all")
+                            out[t] = sub if not sub.empty else None
+                        else:
+                            out[t] = None
+                return out
+            # empty — often rate-limited
+            raise RuntimeError("Empty DataFrame (possibly rate-limited)")
+        except Exception as e:
+            last_exc = e
+            msg = str(e)
+            if any(s in msg for s in ["Rate limited", "Too Many Requests", "429", "rate-limit"]):
+                logging.warning(f"Batch {label}: rate-limited. Backing off (attempt {attempt+1}/{MAX_RETRIES})...")
+                _sleep_backoff(attempt)
+                continue
+            if any(s in msg.lower() for s in ["timed out", "timeout", "temporary failure", "connection reset"]):
+                logging.warning(f"Batch {label}: transient network error. Backing off (attempt {attempt+1}/{MAX_RETRIES})...")
+                _sleep_backoff(attempt)
+                continue
+            break
+    raise last_exc if last_exc else RuntimeError(f"Unknown download error in batch {label}")
 
 def _to_numeric_cols(df: pd.DataFrame, cols):
     for c in cols:
@@ -250,53 +276,88 @@ def _to_numeric_cols(df: pd.DataFrame, cols):
     return df
 
 # ----------------------------------------------------------------------
-# Data fetch + EMA logic (with retry/backoff)
+# Core scan using batch downloads
 # ----------------------------------------------------------------------
 
-def fetch_emas_and_filters(symbol: str):
+def _compute_signal_for_df(df_daily: pd.DataFrame, ema_trend_value: float):
+    # Convert non-numeric columns when possible
+    for col in df_daily.columns:
+        if is_numeric_dtype(df_daily[col]):
+            continue
+        try:
+            df_daily[col] = pd.to_numeric(df_daily[col])
+        except Exception:
+            pass
+
+    if len(df_daily) < max(EMA_SLOW, 50) or pd.isna(ema_trend_value):
+        return None  # insufficient
+
+    prev_fast = to_float(df_daily["ema_fast"].iloc[-2])
+    prev_slow = to_float(df_daily["ema_slow"].iloc[-2])
+    ema_fast  = to_float(df_daily["ema_fast"].iloc[-1])
+    ema_slow  = to_float(df_daily["ema_slow"].iloc[-1])
+    close     = to_float(df_daily["Close"].iloc[-1])
+    rsi       = to_float(df_daily["rsi"].iloc[-1])
+    adx       = to_float(df_daily["adx"].iloc[-1])
+    atr       = to_float(df_daily["atr"].iloc[-1])
+    atr_mean  = to_float(df_daily["atr"].rolling(100).mean().iloc[-1])
+
+    vals = [prev_fast, prev_slow, ema_fast, ema_slow, close, rsi, adx, atr, atr_mean, ema_trend_value]
+    if any(pd.isna(v) or (isinstance(v, float) and np.isnan(v)) for v in vals):
+        return None
+
+    crossed_up     = (prev_fast < prev_slow) and (ema_fast > ema_slow)
+    crossed_down   = (prev_fast > prev_slow) and (ema_fast < ema_slow)
+    is_above_trend = (close > ema_trend_value)
+    is_below_trend = (close < ema_trend_value)
+
+    # OBV rising check (best-effort)
     try:
-        # Daily
-        df_daily = yf_download_retry(symbol, period="120d", interval=TIMEFRAME_DAILY, label="daily")
-        # 4H
-        df_4h = yf_download_retry(symbol, period="180d", interval=TIMEFRAME_4H, label="4h")
+        obv_rising = float(df_daily["obv"].iloc[-1]) > float(df_daily["obv"].iloc[-5]) if len(df_daily["obv"]) > 5 else True
+    except Exception:
+        obv_rising = True
 
-        df_daily = _ensure_flat_columns(df_daily)
-        df_4h = _ensure_flat_columns(df_4h)
+    if crossed_up and is_above_trend and rsi > 55 and adx > 20 and atr > 0.8 * atr_mean and obv_rising:
+        return ("BUY", close, rsi, adx)
 
-        cols = ["Open", "High", "Low", "Close", "Volume"]
-        df_daily = _unbox_arraylike_cells(df_daily, cols)
-        df_4h = _unbox_arraylike_cells(df_4h, cols)
+    if crossed_down and is_below_trend and rsi < 45 and adx > 20 and atr > 0.8 * atr_mean and not obv_rising:
+        return ("SELL", close, rsi, adx)
 
-        if len(df_daily) < max(EMA_SLOW, 50) or len(df_4h) < max(EMA_TREND, 200):
-            raise ValueError("Insufficient data")
+    return None
 
-        df_daily = _to_numeric_cols(df_daily, cols)
-        df_4h = _to_numeric_cols(df_4h, cols)
-
+def _prepare_daily_df(df_daily: pd.DataFrame) -> pd.DataFrame:
+    if df_daily is None or df_daily.empty:
+        return None
+    # Coerce key columns
+    cols = ["Open", "High", "Low", "Close", "Volume"]
+    df_daily = _to_numeric_cols(df_daily.copy(), cols)
+    # Indicators + EMAs
+    try:
         df_daily = fetch_indicators(df_daily)
         df_daily["ema_fast"] = df_daily["Close"].ewm(span=EMA_FAST, adjust=False).mean()
         df_daily["ema_slow"] = df_daily["Close"].ewm(span=EMA_SLOW, adjust=False).mean()
+    except Exception:
+        return None
+    return df_daily
+
+def _extract_ema_trend(df_4h: pd.DataFrame) -> float:
+    if df_4h is None or df_4h.empty:
+        return np.nan
+    try:
+        df_4h = _to_numeric_cols(df_4h.copy(), ["Close"])
         df_4h["ema_trend"] = df_4h["Close"].ewm(span=EMA_TREND, adjust=False).mean()
+        return to_float(df_4h["ema_trend"].iloc[-1])
+    except Exception:
+        return np.nan
 
-        ema_trend = to_float(df_4h["ema_trend"].iloc[-1])
-        return df_daily, ema_trend
-
-    except Exception as e:
-        # Bubble up with symbol context
-        raise ValueError(f"{symbol}: {e}")
-
-# ----------------------------------------------------------------------
-# Scanner
-# ----------------------------------------------------------------------
-
-def scan_tickers(tickers, *, offset=0, batch_size=SCAN_BATCH_SIZE):
+def scan_tickers_batched(tickers, *, offset=0, batch_size=SCAN_BATCH_SIZE):
+    """Scan a rotating batch using *two* batched downloads (daily & 4H)."""
     conf_signals = []
 
     n = len(tickers)
     if n == 0:
         return conf_signals, offset
 
-    # Select rotating window [offset : offset+batch)
     start = offset % n
     end = start + batch_size
     if end <= n:
@@ -306,73 +367,64 @@ def scan_tickers(tickers, *, offset=0, batch_size=SCAN_BATCH_SIZE):
         batch = tickers[start:] + tickers[:(end % n)]
         next_offset = end % n
 
+    LAST_SCAN_SUMMARY.update({
+        "universe_size": n,
+        "last_batch_start": start,
+        "last_batch_size": len(batch),
+        "signals_in_batch": 0,
+        "coverage_pct": (next_offset / n) * 100.0 if n else 0.0,
+        "last_error": None,
+    })
+
     logging.info(f"Scanning {len(batch)} tickers (batch {start}->{(end-1)%n})")
 
-    for idx, sym in enumerate(batch, 1):
-        # Gentle pacing to reduce rate-limit risk
+    # --- Download both intervals for the whole batch ---
+    try:
+        daily_map = _download_batch(batch, period="120d", interval=TIMEFRAME_DAILY, label="daily")
         if RATE_LIMIT_DELAY > 0:
             time.sleep(RATE_LIMIT_DELAY)
+        h4_map    = _download_batch(batch, period="180d", interval=TIMEFRAME_4H, label="4h")
+        if RATE_LIMIT_DELAY > 0:
+            time.sleep(RATE_LIMIT_DELAY)
+    except Exception as e:
+        # If the *batch* fails, record error and skip this round.
+        LAST_SCAN_SUMMARY["last_error"] = f"Batch download failed: {e}"
+        logging.warning(f"Batch download failed: {e}")
+        return conf_signals, next_offset
 
-        try:
-            df, ema_trend = fetch_emas_and_filters(sym)
+    # --- Process each symbol with the already-fetched DFs ---
+    for sym in batch:
+        df_daily = daily_map.get(sym)
+        df_4h = h4_map.get(sym)
 
-            # Convert non-numeric columns when possible
-            for col in df.columns:
-                if is_numeric_dtype(df[col]):
-                    continue
-                try:
-                    df[col] = pd.to_numeric(df[col])
-                except Exception:
-                    pass
+        # Skip quietly if no/insufficient data (prevents noisy logs like PSKY)
+        if df_daily is None or df_daily.empty or df_4h is None or df_4h.empty:
+            continue
 
-            prev_fast = to_float(df["ema_fast"].iloc[-2])
-            prev_slow = to_float(df["ema_slow"].iloc[-2])
-            ema_fast  = to_float(df["ema_fast"].iloc[-1])
-            ema_slow  = to_float(df["ema_slow"].iloc[-1])
-            close     = to_float(df["Close"].iloc[-1])
-            rsi       = to_float(df["rsi"].iloc[-1])
-            adx       = to_float(df["adx"].iloc[-1])
-            atr       = to_float(df["atr"].iloc[-1])
-            atr_mean  = to_float(df["atr"].rolling(100).mean().iloc[-1])
-            obv       = df["obv"].copy()
+        # Prepare dataframes
+        df_daily = _prepare_daily_df(df_daily)
+        if df_daily is None or len(df_daily) < max(EMA_SLOW, 50):
+            continue
 
-            vals = [prev_fast, prev_slow, ema_fast, ema_slow,
-                    close, rsi, adx, atr, atr_mean, ema_trend]
+        ema_trend_value = _extract_ema_trend(df_4h)
+        if pd.isna(ema_trend_value):
+            continue
 
-            if any(pd.isna(v) or (isinstance(v, float) and np.isnan(v)) for v in vals):
-                logging.debug(f"Skipping {sym}: NaN or invalid numeric data.")
-                continue
+        sig = _compute_signal_for_df(df_daily, ema_trend_value)
+        if sig is None:
+            continue
 
-            crossed_up     = (prev_fast < prev_slow) and (ema_fast > ema_slow)
-            crossed_down   = (prev_fast > prev_slow) and (ema_fast < ema_slow)
-            is_above_trend = (close > ema_trend)
-            is_below_trend = (close < ema_trend)
+        side, close, rsi, adx = sig
+        if side == "BUY":
+            msg = f"📈 {sym} BUY @ {close:.2f} | RSI {rsi:.1f}, ADX {adx:.1f}"
+            conf_signals.append(msg)
+            record_signal("BUY", sym, close)
+        elif side == "SELL":
+            msg = f"🔻 {sym} SELL @ {close:.2f} | RSI {rsi:.1f}, ADX {adx:.1f}"
+            conf_signals.append(msg)
+            record_signal("SELL", sym, close)
 
-            try:
-                obv_rising = float(obv.iloc[-1]) > float(obv.iloc[-5]) if len(obv) > 5 else True
-            except Exception:
-                obv_rising = True
-
-            if crossed_up and is_above_trend and rsi > 55 and adx > 20 and atr > 0.8 * atr_mean and obv_rising:
-                msg = f"📈 {sym} BUY @ {close:.2f} | RSI {rsi:.1f}, ADX {adx:.1f}"
-                conf_signals.append(msg)
-                record_signal("BUY", sym, close)
-
-            elif crossed_down and is_below_trend and rsi < 45 and adx > 20 and atr > 0.8 * atr_mean and not obv_rising:
-                msg = f"🔻 {sym} SELL @ {close:.2f} | RSI {rsi:.1f}, ADX {adx:.1f}"
-                conf_signals.append(msg)
-                record_signal("SELL", sym, close)
-
-        except Exception as e:
-            # Log rate-limit issues tersely; others verbosely
-            msg = str(e)
-            if any(s in msg for s in ["Rate limited", "Too Many Requests", "429"]):
-                logging.warning(f"{sym}: rate-limited; will retry in future batches.")
-            elif "Empty DataFrame" in msg or "No data returned" in msg:
-                logging.info(f"{sym}: no data; skipping.")
-            else:
-                logging.error(f"{sym}: {e}")
-
+    LAST_SCAN_SUMMARY["signals_in_batch"] = len(conf_signals)
     return conf_signals, next_offset
 
 # ----------------------------------------------------------------------
@@ -387,6 +439,11 @@ def record_signal(signal_type, sym, price):
         df.to_csv(LOG_FILE, mode="a", header=False, index=False)
     else:
         df.to_csv(LOG_FILE, index=False)
+
+def _download_single_symbol_for_backtest(sym: str):
+    # Use the batched retry/backoff for a single symbol via list
+    out = _download_batch([sym], period="10d", interval="1d", label=f"backtest:{sym}")
+    return out.get(sym)
 
 def evaluate_old_signals():
     if not os.path.exists(LOG_FILE):
@@ -417,9 +474,8 @@ def evaluate_old_signals():
         sym  = str(row["symbol"])
         side = str(row["signal"])
         entry = to_float(row["price"])
-        entry_date = row["date"]
         try:
-            df_hist = yf_download_retry(sym, period="10d", interval="1d", label="backtest")
+            df_hist = _download_single_symbol_for_backtest(sym)
             if df_hist is None or len(df_hist) < HOLD_DAYS:
                 continue
             exit_price = float(df_hist["Close"].iloc[HOLD_DAYS - 1])
@@ -468,53 +524,7 @@ def _build_universe():
     return tickers
 
 # ----------------------------------------------------------------------
-# Main
-# ----------------------------------------------------------------------
-
-BATCHES_PER_LOOP = int(os.getenv("BATCHES_PER_LOOP", 1))
-BATCH_PAUSE = float(os.getenv("BATCH_PAUSE", 0))
-
-def main():
-    try:
-        tickers = _build_universe()
-        logging.info(f"Total tickers to scan: {len(tickers)}")
-        logging.info("🚀 EMA Multi-Factor Scanner Started")
-    except Exception as e:
-        logging.error(f"Failed to build ticker universe: {e}")
-        raise
-
-    random.shuffle(tickers)
-    offset = 0
-
-    while True:
-        try:
-            total_signals = 0
-            for i in range(max(1, BATCHES_PER_LOOP)):
-                conf_signals, offset = scan_tickers(
-                    tickers, offset=offset, batch_size=SCAN_BATCH_SIZE
-                )
-                total_signals += len(conf_signals)
-                if BATCH_PAUSE > 0 and i < BATCHES_PER_LOOP - 1:
-                    time.sleep(BATCH_PAUSE)
-
-            if total_signals == 0:
-                logging.info(
-                    f"{datetime.datetime.now():%H:%M} — No signals in these {max(1, BATCHES_PER_LOOP)} batch(es)"
-                )
-
-            report = evaluate_old_signals()
-            if report:
-                send_discord_message(report)
-
-        except Exception as e:
-            logging.error(f"⚠️ Global loop error: {type(e).__name__} — {e}")
-            traceback.print_exc()
-
-        time.sleep(CHECK_INTERVAL)
-
-
-# ----------------------------------------------------------------------
-# Flask (keep-alive)
+# Flask (keep-alive + health)
 # ----------------------------------------------------------------------
 
 app = Flask(__name__)
@@ -523,9 +533,65 @@ app = Flask(__name__)
 def home():
     return "EMA Scanner running."
 
+@app.route('/healthz')
+def healthz():
+    return jsonify(LAST_SCAN_SUMMARY)
+
 def run_flask():
     port = int(os.environ.get("PORT", 10000))
     app.run(host="0.0.0.0", port=port)
+
+# ----------------------------------------------------------------------
+# Main
+# ----------------------------------------------------------------------
+
+def main():
+    try:
+        tickers = _build_universe()
+        logging.info(f"Total tickers to scan: {len(tickers)}")
+        logging.info("🚀 EMA Multi-Factor Scanner Started")
+        send_discord_message("🟢 Bot online and scanning…")
+    except Exception as e:
+        logging.error(f"Failed to build ticker universe: {e}")
+        raise
+
+    # Shuffle once to spread load
+    random.shuffle(tickers)
+    LAST_SCAN_SUMMARY["universe_size"] = len(tickers)
+
+    offset = 0
+    while True:
+        try:
+            total_signals = 0
+            batches = max(1, BATCHES_PER_LOOP)
+            for i in range(batches):
+                conf_signals, offset = scan_tickers_batched(
+                    tickers, offset=offset, batch_size=SCAN_BATCH_SIZE
+                )
+                total_signals += len(conf_signals)
+
+                if conf_signals:
+                    now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M")
+                    msg = f"**✅ EMA Multi-Factor Alerts ({now})**\n" + "\n".join(conf_signals)
+                    send_discord_message(msg)
+
+                # brief pause between intra-loop batches
+                if i < batches - 1 and BATCH_PAUSE > 0:
+                    time.sleep(BATCH_PAUSE)
+
+            if total_signals == 0:
+                logging.info(f"{datetime.datetime.now():%H:%M} — No signals in these {batches} batch(es)")
+
+            report = evaluate_old_signals()
+            if report:
+                send_discord_message(report)
+
+        except Exception as e:
+            LAST_SCAN_SUMMARY["last_error"] = f"{type(e).__name__}: {e}"
+            logging.error(f"⚠️ Global loop error: {type(e).__name__} — {e}")
+            traceback.print_exc()
+
+        time.sleep(CHECK_INTERVAL)
 
 # ----------------------------------------------------------------------
 # Entrypoint

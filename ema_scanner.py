@@ -471,6 +471,9 @@ def _build_universe():
 # Main
 # ----------------------------------------------------------------------
 
+BATCHES_PER_LOOP = int(os.getenv("BATCHES_PER_LOOP", 1))
+BATCH_PAUSE = float(os.getenv("BATCH_PAUSE", 0))
+
 def main():
     try:
         tickers = _build_universe()
@@ -480,20 +483,24 @@ def main():
         logging.error(f"Failed to build ticker universe: {e}")
         raise
 
-    # Shuffle once to distribute load; keep deterministic order across restarts if desired
     random.shuffle(tickers)
-
     offset = 0
+
     while True:
         try:
-            conf_signals, offset = scan_tickers(tickers, offset=offset, batch_size=SCAN_BATCH_SIZE)
+            total_signals = 0
+            for i in range(max(1, BATCHES_PER_LOOP)):
+                conf_signals, offset = scan_tickers(
+                    tickers, offset=offset, batch_size=SCAN_BATCH_SIZE
+                )
+                total_signals += len(conf_signals)
+                if BATCH_PAUSE > 0 and i < BATCHES_PER_LOOP - 1:
+                    time.sleep(BATCH_PAUSE)
 
-            if conf_signals:
-                now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M")
-                msg = f"**✅ EMA Multi-Factor Alerts ({now})**\n" + "\n".join(conf_signals)
-                send_discord_message(msg)
-            else:
-                logging.info(f"{datetime.datetime.now():%H:%M} — No signals in this batch")
+            if total_signals == 0:
+                logging.info(
+                    f"{datetime.datetime.now():%H:%M} — No signals in these {max(1, BATCHES_PER_LOOP)} batch(es)"
+                )
 
             report = evaluate_old_signals()
             if report:
@@ -504,6 +511,7 @@ def main():
             traceback.print_exc()
 
         time.sleep(CHECK_INTERVAL)
+
 
 # ----------------------------------------------------------------------
 # Flask (keep-alive)

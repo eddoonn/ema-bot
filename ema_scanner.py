@@ -48,15 +48,18 @@ CAPITAL_PER_TRADE  = float(os.getenv("CAPITAL_PER_TRADE", 500))
 LOG_FILE           = os.getenv("LOG_FILE", "trades_log.csv")
 
 # scanning cadence
-SCAN_BATCH_SIZE    = int(os.getenv("SCAN_BATCH_SIZE", 150))       # tickers per batch
-BATCHES_PER_LOOP   = int(os.getenv("BATCHES_PER_LOOP", 1))        # how many batches each loop
-BATCH_PAUSE        = float(os.getenv("BATCH_PAUSE", 3.0))         # seconds between batches in the same loop
+SCAN_BATCH_SIZE    = int(os.getenv("SCAN_BATCH_SIZE", 150))       # tickers per rotating batch
+BATCHES_PER_LOOP   = int(os.getenv("BATCHES_PER_LOOP", 1))        # how many batches per loop
+BATCH_PAUSE        = float(os.getenv("BATCH_PAUSE", 3.0))         # seconds pause between batches in a loop
 
-# rate-limit/resiliency
+# rate-limit / resiliency
 MAX_RETRIES        = int(os.getenv("MAX_RETRIES", 3))
 BACKOFF_BASE       = float(os.getenv("BACKOFF_BASE", 1.7))
 BACKOFF_JITTER_MAX = float(os.getenv("BACKOFF_JITTER_MAX", 0.35))
-RATE_LIMIT_DELAY   = float(os.getenv("RATE_LIMIT_DELAY", 0.0))    # small delay after each *batch* download
+RATE_LIMIT_DELAY   = float(os.getenv("RATE_LIMIT_DELAY", 0.0))    # small pause after each chunk request
+
+# yfinance chunking inside a batch
+YF_BATCH_CHUNK     = int(os.getenv("YF_BATCH_CHUNK", 50))         # 40–60 recommended
 
 # logging
 logging.basicConfig(
@@ -65,6 +68,9 @@ logging.basicConfig(
     datefmt="%Y-%m-%d %H:%M"
 )
 logger = logging.getLogger(__name__)
+
+# quiet yfinance’s own "Failed download" lines
+logging.getLogger("yfinance").setLevel(logging.ERROR)
 
 # ----------------------------------------------------------------------
 # Globals for health reporting
@@ -215,60 +221,6 @@ def fetch_indicators(df: pd.DataFrame) -> pd.DataFrame:
     df["atr"] = atr.average_true_range()
     return df
 
-# ----------------------------------------------------------------------
-# Batch downloads (multi-ticker) to reduce rate limits
-# ----------------------------------------------------------------------
-
-def _download_batch(tickers, *, period, interval, label):
-    """
-    One yf.download call for many tickers. Returns dict[ticker] -> DataFrame (or None).
-    Retries on rate-limit / transient errors.
-    """
-    last_exc = None
-    # yfinance returns MultiIndex columns when list provided
-    for attempt in range(MAX_RETRIES):
-        try:
-            df = yf.download(
-                tickers,
-                period=period,
-                interval=interval,
-                progress=False,
-                auto_adjust=False,
-                threads=False,
-                group_by='ticker'  # ensures top-level ticker columns
-            )
-            if isinstance(df, pd.DataFrame) and not df.empty:
-                out = {}
-                # If only ONE ticker got returned despite list, yfinance returns normal columns
-                if not isinstance(df.columns, pd.MultiIndex):
-                    # Unknown mapping — treat as undifferentiated; assign to first ticker only
-                    t = tickers[0] if tickers else None
-                    out[t] = df
-                else:
-                    # columns like: (TICKER, Open/High/Low/Close/Adj Close/Volume)
-                    for t in tickers:
-                        if t in df.columns.get_level_values(0):
-                            sub = df[t].dropna(how="all")
-                            out[t] = sub if not sub.empty else None
-                        else:
-                            out[t] = None
-                return out
-            # empty — often rate-limited
-            raise RuntimeError("Empty DataFrame (possibly rate-limited)")
-        except Exception as e:
-            last_exc = e
-            msg = str(e)
-            if any(s in msg for s in ["Rate limited", "Too Many Requests", "429", "rate-limit"]):
-                logging.warning(f"Batch {label}: rate-limited. Backing off (attempt {attempt+1}/{MAX_RETRIES})...")
-                _sleep_backoff(attempt)
-                continue
-            if any(s in msg.lower() for s in ["timed out", "timeout", "temporary failure", "connection reset"]):
-                logging.warning(f"Batch {label}: transient network error. Backing off (attempt {attempt+1}/{MAX_RETRIES})...")
-                _sleep_backoff(attempt)
-                continue
-            break
-    raise last_exc if last_exc else RuntimeError(f"Unknown download error in batch {label}")
-
 def _to_numeric_cols(df: pd.DataFrame, cols):
     for c in cols:
         if c in df.columns:
@@ -276,11 +228,107 @@ def _to_numeric_cols(df: pd.DataFrame, cols):
     return df
 
 # ----------------------------------------------------------------------
-# Core scan using batch downloads
+# Batch downloads (CHUNKED) to reduce rate limits
 # ----------------------------------------------------------------------
 
+def _download_batch_chunked(tickers, *, period, interval, label):
+    """
+    Download many tickers by splitting into chunks to avoid rate limits.
+    Returns dict[ticker] -> DataFrame (or None).
+    """
+    if not tickers:
+        return {}
+
+    chunks = [tickers[i:i+YF_BATCH_CHUNK] for i in range(0, len(tickers), YF_BATCH_CHUNK)]
+    merged = {}
+
+    for ci, chunk in enumerate(chunks, 1):
+        last_exc = None
+        for attempt in range(MAX_RETRIES):
+            try:
+                df = yf.download(
+                    chunk,
+                    period=period,
+                    interval=interval,
+                    progress=False,
+                    auto_adjust=False,
+                    threads=False,
+                    group_by='ticker'
+                )
+                if isinstance(df, pd.DataFrame) and not df.empty:
+                    if isinstance(df.columns, pd.MultiIndex):
+                        for t in chunk:
+                            if t in df.columns.get_level_values(0):
+                                sub = df[t].dropna(how="all")
+                                merged[t] = sub if not sub.empty else None
+                            else:
+                                merged[t] = None
+                    else:
+                        # Rare case: single wide frame — assign to first symbol
+                        merged[chunk[0]] = df
+                else:
+                    # empty — likely rate-limited
+                    raise RuntimeError("Empty DataFrame (possibly rate-limited)")
+
+                if RATE_LIMIT_DELAY > 0:
+                    time.sleep(RATE_LIMIT_DELAY)
+                break  # chunk done
+
+            except Exception as e:
+                last_exc = e
+                msg = str(e)
+                if any(s in msg for s in ["Rate limited", "Too Many Requests", "429", "rate-limit"]):
+                    logging.warning(f"{label} chunk {ci}/{len(chunks)}: rate-limited, backoff attempt {attempt+1}/{MAX_RETRIES}")
+                    _sleep_backoff(attempt)
+                    continue
+                if any(s in msg.lower() for s in ["timed out", "timeout", "temporary failure", "connection reset"]):
+                    logging.warning(f"{label} chunk {ci}/{len(chunks)}: transient error, backoff attempt {attempt+1}/{MAX_RETRIES}")
+                    _sleep_backoff(attempt)
+                    continue
+                # non-transient — give up this chunk
+                break
+
+        if chunk and (chunk[0] not in merged):
+            if last_exc:
+                logging.warning(f"{label} chunk {ci}/{len(chunks)} failed: {last_exc}")
+            for t in chunk:
+                merged.setdefault(t, None)
+
+    return merged
+
+def _download_single_symbol(sym: str, *, period, interval, label):
+    out = _download_batch_chunked([sym], period=period, interval=interval, label=label)
+    return out.get(sym)
+
+# ----------------------------------------------------------------------
+# Core scan helpers
+# ----------------------------------------------------------------------
+
+def _prepare_daily_df(df_daily: pd.DataFrame) -> pd.DataFrame:
+    if df_daily is None or df_daily.empty:
+        return None
+    cols = ["Open", "High", "Low", "Close", "Volume"]
+    df_daily = _to_numeric_cols(df_daily.copy(), cols)
+    try:
+        df_daily = fetch_indicators(df_daily)
+        df_daily["ema_fast"] = df_daily["Close"].ewm(span=EMA_FAST, adjust=False).mean()
+        df_daily["ema_slow"] = df_daily["Close"].ewm(span=EMA_SLOW, adjust=False).mean()
+    except Exception:
+        return None
+    return df_daily
+
+def _extract_ema_trend(df_4h: pd.DataFrame) -> float:
+    if df_4h is None or df_4h.empty:
+        return np.nan
+    try:
+        df_4h = _to_numeric_cols(df_4h.copy(), ["Close"])
+        df_4h["ema_trend"] = df_4h["Close"].ewm(span=EMA_TREND, adjust=False).mean()
+        return to_float(df_4h["ema_trend"].iloc[-1])
+    except Exception:
+        return np.nan
+
 def _compute_signal_for_df(df_daily: pd.DataFrame, ema_trend_value: float):
-    # Convert non-numeric columns when possible
+    # Convert non-numeric columns where applicable
     for col in df_daily.columns:
         if is_numeric_dtype(df_daily[col]):
             continue
@@ -290,7 +338,7 @@ def _compute_signal_for_df(df_daily: pd.DataFrame, ema_trend_value: float):
             pass
 
     if len(df_daily) < max(EMA_SLOW, 50) or pd.isna(ema_trend_value):
-        return None  # insufficient
+        return None
 
     prev_fast = to_float(df_daily["ema_fast"].iloc[-2])
     prev_slow = to_float(df_daily["ema_slow"].iloc[-2])
@@ -311,7 +359,6 @@ def _compute_signal_for_df(df_daily: pd.DataFrame, ema_trend_value: float):
     is_above_trend = (close > ema_trend_value)
     is_below_trend = (close < ema_trend_value)
 
-    # OBV rising check (best-effort)
     try:
         obv_rising = float(df_daily["obv"].iloc[-1]) > float(df_daily["obv"].iloc[-5]) if len(df_daily["obv"]) > 5 else True
     except Exception:
@@ -325,33 +372,12 @@ def _compute_signal_for_df(df_daily: pd.DataFrame, ema_trend_value: float):
 
     return None
 
-def _prepare_daily_df(df_daily: pd.DataFrame) -> pd.DataFrame:
-    if df_daily is None or df_daily.empty:
-        return None
-    # Coerce key columns
-    cols = ["Open", "High", "Low", "Close", "Volume"]
-    df_daily = _to_numeric_cols(df_daily.copy(), cols)
-    # Indicators + EMAs
-    try:
-        df_daily = fetch_indicators(df_daily)
-        df_daily["ema_fast"] = df_daily["Close"].ewm(span=EMA_FAST, adjust=False).mean()
-        df_daily["ema_slow"] = df_daily["Close"].ewm(span=EMA_SLOW, adjust=False).mean()
-    except Exception:
-        return None
-    return df_daily
-
-def _extract_ema_trend(df_4h: pd.DataFrame) -> float:
-    if df_4h is None or df_4h.empty:
-        return np.nan
-    try:
-        df_4h = _to_numeric_cols(df_4h.copy(), ["Close"])
-        df_4h["ema_trend"] = df_4h["Close"].ewm(span=EMA_TREND, adjust=False).mean()
-        return to_float(df_4h["ema_trend"].iloc[-1])
-    except Exception:
-        return np.nan
+# ----------------------------------------------------------------------
+# Scanner (batched + chunked)
+# ----------------------------------------------------------------------
 
 def scan_tickers_batched(tickers, *, offset=0, batch_size=SCAN_BATCH_SIZE):
-    """Scan a rotating batch using *two* batched downloads (daily & 4H)."""
+    """Scan a rotating batch using chunked multi-ticker downloads."""
     conf_signals = []
 
     n = len(tickers)
@@ -378,30 +404,33 @@ def scan_tickers_batched(tickers, *, offset=0, batch_size=SCAN_BATCH_SIZE):
 
     logging.info(f"Scanning {len(batch)} tickers (batch {start}->{(end-1)%n})")
 
-    # --- Download both intervals for the whole batch ---
+    # Chunked batch downloads
     try:
-        daily_map = _download_batch(batch, period="120d", interval=TIMEFRAME_DAILY, label="daily")
+        daily_map = _download_batch_chunked(batch, period="120d", interval=TIMEFRAME_DAILY, label="daily")
         if RATE_LIMIT_DELAY > 0:
             time.sleep(RATE_LIMIT_DELAY)
-        h4_map    = _download_batch(batch, period="180d", interval=TIMEFRAME_4H, label="4h")
+        h4_map    = _download_batch_chunked(batch, period="180d", interval=TIMEFRAME_4H, label="4h")
         if RATE_LIMIT_DELAY > 0:
             time.sleep(RATE_LIMIT_DELAY)
     except Exception as e:
-        # If the *batch* fails, record error and skip this round.
         LAST_SCAN_SUMMARY["last_error"] = f"Batch download failed: {e}"
         logging.warning(f"Batch download failed: {e}")
         return conf_signals, next_offset
 
-    # --- Process each symbol with the already-fetched DFs ---
+    # Evaluate each symbol
     for sym in batch:
         df_daily = daily_map.get(sym)
-        df_4h = h4_map.get(sym)
+        df_4h    = h4_map.get(sym)
 
-        # Skip quietly if no/insufficient data (prevents noisy logs like PSKY)
+        # Fallback single-symbol fetch on None/empty
+        if (df_daily is None) or (df_daily is not None and df_daily.empty):
+            df_daily = _download_single_symbol(sym, period="120d", interval=TIMEFRAME_DAILY, label=f"daily:{sym}")
+        if (df_4h is None) or (df_4h is not None and df_4h.empty):
+            df_4h    = _download_single_symbol(sym, period="180d", interval=TIMEFRAME_4H, label=f"4h:{sym}")
+
         if df_daily is None or df_daily.empty or df_4h is None or df_4h.empty:
             continue
 
-        # Prepare dataframes
         df_daily = _prepare_daily_df(df_daily)
         if df_daily is None or len(df_daily) < max(EMA_SLOW, 50):
             continue
@@ -441,9 +470,7 @@ def record_signal(signal_type, sym, price):
         df.to_csv(LOG_FILE, index=False)
 
 def _download_single_symbol_for_backtest(sym: str):
-    # Use the batched retry/backoff for a single symbol via list
-    out = _download_batch([sym], period="10d", interval="1d", label=f"backtest:{sym}")
-    return out.get(sym)
+    return _download_single_symbol(sym, period="10d", interval="1d", label=f"backtest:{sym}")
 
 def evaluate_old_signals():
     if not os.path.exists(LOG_FILE):
@@ -555,7 +582,6 @@ def main():
         logging.error(f"Failed to build ticker universe: {e}")
         raise
 
-    # Shuffle once to spread load
     random.shuffle(tickers)
     LAST_SCAN_SUMMARY["universe_size"] = len(tickers)
 
@@ -564,6 +590,7 @@ def main():
         try:
             total_signals = 0
             batches = max(1, BATCHES_PER_LOOP)
+
             for i in range(batches):
                 conf_signals, offset = scan_tickers_batched(
                     tickers, offset=offset, batch_size=SCAN_BATCH_SIZE
@@ -575,7 +602,6 @@ def main():
                     msg = f"**✅ EMA Multi-Factor Alerts ({now})**\n" + "\n".join(conf_signals)
                     send_discord_message(msg)
 
-                # brief pause between intra-loop batches
                 if i < batches - 1 and BATCH_PAUSE > 0:
                     time.sleep(BATCH_PAUSE)
 

@@ -14,6 +14,7 @@ import time
 import logging
 import datetime
 import traceback
+import random
 import urllib.request
 
 import numpy as np
@@ -29,19 +30,26 @@ from pandas.api.types import is_numeric_dtype
 # Configuration
 # ----------------------------------------------------------------------
 
-DISCORD_WEBHOOK = os.getenv("DISCORD_WEBHOOK", "https://discord.com/api/webhooks/REPLACE_WITH_YOUR_WEBHOOK")
+DISCORD_WEBHOOK = os.getenv("DISCORD_WEBHOOK", "https://discord.com/api/webhooks/1425616478601871400/AMbiCffNSI7lOsqLPBZ5UDPOStNW0UgcAJAqMU0D1QxDzD2EymlnrbTQxN44XErNkaXm")
 
-EMA_FAST = int(os.getenv("EMA_FAST", 13))
-EMA_SLOW = int(os.getenv("EMA_SLOW", 21))
+EMA_FAST  = int(os.getenv("EMA_FAST", 13))
+EMA_SLOW  = int(os.getenv("EMA_SLOW", 21))
 EMA_TREND = int(os.getenv("EMA_TREND", 200))
 
 TIMEFRAME_DAILY = os.getenv("TIMEFRAME_DAILY", "1d")
-TIMEFRAME_4H = os.getenv("TIMEFRAME_4H", "4h")
+TIMEFRAME_4H    = os.getenv("TIMEFRAME_4H", "4h")
 
-CHECK_INTERVAL = int(os.getenv("CHECK_INTERVAL", 900))  # 15 minutes
-HOLD_DAYS = int(os.getenv("HOLD_DAYS", 5))
-CAPITAL_PER_TRADE = float(os.getenv("CAPITAL_PER_TRADE", 500))
-LOG_FILE = os.getenv("LOG_FILE", "trades_log.csv")
+CHECK_INTERVAL     = int(os.getenv("CHECK_INTERVAL", 900))    # seconds
+HOLD_DAYS          = int(os.getenv("HOLD_DAYS", 5))
+CAPITAL_PER_TRADE  = float(os.getenv("CAPITAL_PER_TRADE", 500))
+LOG_FILE           = os.getenv("LOG_FILE", "trades_log.csv")
+
+# Rate limiting / batching
+SCAN_BATCH_SIZE    = int(os.getenv("SCAN_BATCH_SIZE", 150))    # tickers per loop
+RATE_LIMIT_DELAY   = float(os.getenv("RATE_LIMIT_DELAY", 0.15))# seconds between symbols
+MAX_RETRIES        = int(os.getenv("MAX_RETRIES", 3))
+BACKOFF_BASE       = float(os.getenv("BACKOFF_BASE", 1.7))
+BACKOFF_JITTER_MAX = float(os.getenv("BACKOFF_JITTER_MAX", 0.35))
 
 logging.basicConfig(
     level=logging.INFO,
@@ -82,7 +90,7 @@ def _normalize_ticker(x):
     if not s:
         return None
     s = s.split()[0]
-    s = s.replace(".", "-")
+    s = s.replace(".", "-")  # BRK.B -> BRK-B
     if not re.fullmatch(r"[A-Z\-]+", s):
         return None
     if len(s) > 12:
@@ -103,6 +111,48 @@ def safe_read_html(url):
     with urllib.request.urlopen(req, timeout=20) as resp:
         html = resp.read()
     return pd.read_html(html)
+
+def _sleep_backoff(attempt: int):
+    # attempt: 0..MAX_RETRIES-1
+    wait = (BACKOFF_BASE ** attempt) + random.random() * BACKOFF_JITTER_MAX
+    time.sleep(wait)
+
+def yf_download_retry(ticker: str, *, period: str, interval: str, label: str):
+    """
+    Resilient wrapper over yf.download to soften Yahoo rate limits.
+    Returns DataFrame or raises after retries.
+    """
+    last_exc = None
+    for attempt in range(MAX_RETRIES):
+        try:
+            df = yf.download(
+                ticker,
+                period=period,
+                interval=interval,
+                progress=False,
+                auto_adjust=False,
+                threads=False
+            )
+            # Some rate-limit cases return empty frames silently
+            if df is not None and not df.empty:
+                return df
+            raise RuntimeError("Empty DataFrame (possibly rate-limited)")
+        except Exception as e:
+            last_exc = e
+            msg = str(e)
+            # Heuristics: YFRateLimitError or HTTP 429 or “Too Many Requests” -> backoff and retry
+            if any(s in msg for s in ["Rate limited", "Too Many Requests", "429", "rate-limit", "rate limited"]):
+                logging.warning(f"{ticker}: rate-limited during {label}. Backing off (attempt {attempt+1}/{MAX_RETRIES})...")
+                _sleep_backoff(attempt)
+                continue
+            # Other transient network errors: retry as well
+            if any(s in msg.lower() for s in ["timed out", "timeout", "temporary failure", "connection reset"]):
+                logging.warning(f"{ticker}: transient network error during {label}. Backing off (attempt {attempt+1}/{MAX_RETRIES})...")
+                _sleep_backoff(attempt)
+                continue
+            # Non-transient -> break early
+            break
+    raise last_exc if last_exc else RuntimeError("Unknown download error")
 
 # ----------------------------------------------------------------------
 # Ticker universes
@@ -138,8 +188,10 @@ def get_nasdaq100_tickers():
             if "Ticker" in t.columns:
                 df = t
                 break
-        if df is None:
+        if df is None and len(tables) > 4:
             df = tables[4]
+        if df is None:
+            raise ValueError("No NASDAQ-100 table with 'Ticker' column found.")
         tickers = df["Ticker"].dropna().astype(str).tolist()
         logging.info(f"Loaded {len(tickers)} NASDAQ-100 tickers from Wikipedia.")
         return tickers
@@ -198,22 +250,15 @@ def _to_numeric_cols(df: pd.DataFrame, cols):
     return df
 
 # ----------------------------------------------------------------------
-# Data fetch + EMA logic
+# Data fetch + EMA logic (with retry/backoff)
 # ----------------------------------------------------------------------
 
 def fetch_emas_and_filters(symbol: str):
     try:
-        df_daily = yf.download(
-            symbol, period="120d", interval=TIMEFRAME_DAILY,
-            progress=False, auto_adjust=False, threads=False
-        )
-        df_4h = yf.download(
-            symbol, period="180d", interval=TIMEFRAME_4H,
-            progress=False, auto_adjust=False, threads=False
-        )
-
-        if df_daily is None or df_daily.empty or df_4h is None or df_4h.empty:
-            raise ValueError("No data returned")
+        # Daily
+        df_daily = yf_download_retry(symbol, period="120d", interval=TIMEFRAME_DAILY, label="daily")
+        # 4H
+        df_4h = yf_download_retry(symbol, period="180d", interval=TIMEFRAME_4H, label="4h")
 
         df_daily = _ensure_flat_columns(df_daily)
         df_4h = _ensure_flat_columns(df_4h)
@@ -237,20 +282,41 @@ def fetch_emas_and_filters(symbol: str):
         return df_daily, ema_trend
 
     except Exception as e:
+        # Bubble up with symbol context
         raise ValueError(f"{symbol}: {e}")
 
 # ----------------------------------------------------------------------
 # Scanner
 # ----------------------------------------------------------------------
 
-def scan_tickers(tickers):
+def scan_tickers(tickers, *, offset=0, batch_size=SCAN_BATCH_SIZE):
     conf_signals = []
 
-    for sym in tickers:
+    n = len(tickers)
+    if n == 0:
+        return conf_signals, offset
+
+    # Select rotating window [offset : offset+batch)
+    start = offset % n
+    end = start + batch_size
+    if end <= n:
+        batch = tickers[start:end]
+        next_offset = end % n
+    else:
+        batch = tickers[start:] + tickers[:(end % n)]
+        next_offset = end % n
+
+    logging.info(f"Scanning {len(batch)} tickers (batch {start}->{(end-1)%n})")
+
+    for idx, sym in enumerate(batch, 1):
+        # Gentle pacing to reduce rate-limit risk
+        if RATE_LIMIT_DELAY > 0:
+            time.sleep(RATE_LIMIT_DELAY)
+
         try:
             df, ema_trend = fetch_emas_and_filters(sym)
 
-            # Convert non-numeric columns when possible (no deprecated errors="ignore")
+            # Convert non-numeric columns when possible
             for col in df.columns:
                 if is_numeric_dtype(df[col]):
                     continue
@@ -298,9 +364,16 @@ def scan_tickers(tickers):
                 record_signal("SELL", sym, close)
 
         except Exception as e:
-            logging.error(f"{sym}: {e}")
+            # Log rate-limit issues tersely; others verbosely
+            msg = str(e)
+            if any(s in msg for s in ["Rate limited", "Too Many Requests", "429"]):
+                logging.warning(f"{sym}: rate-limited; will retry in future batches.")
+            elif "Empty DataFrame" in msg or "No data returned" in msg:
+                logging.info(f"{sym}: no data; skipping.")
+            else:
+                logging.error(f"{sym}: {e}")
 
-    return conf_signals
+    return conf_signals, next_offset
 
 # ----------------------------------------------------------------------
 # Backtest
@@ -329,7 +402,7 @@ def evaluate_old_signals():
         return None
 
     try:
-        df["date"] = pd.to_datetime(df["date"], errors="coerce")
+        df["date"]  = pd.to_datetime(df["date"], errors="coerce")
         df["price"] = pd.to_numeric(df["price"], errors="coerce")
     except Exception:
         pass
@@ -346,8 +419,7 @@ def evaluate_old_signals():
         entry = to_float(row["price"])
         entry_date = row["date"]
         try:
-            df_hist = yf.download(sym, start=entry_date, period="10d",
-                                  interval="1d", progress=False)
+            df_hist = yf_download_retry(sym, period="10d", interval="1d", label="backtest")
             if df_hist is None or len(df_hist) < HOLD_DAYS:
                 continue
             exit_price = float(df_hist["Close"].iloc[HOLD_DAYS - 1])
@@ -381,7 +453,7 @@ def evaluate_old_signals():
     return msg
 
 # ----------------------------------------------------------------------
-# Main
+# Universe
 # ----------------------------------------------------------------------
 
 def _build_universe():
@@ -395,6 +467,10 @@ def _build_universe():
     tickers = sorted(set(normalize_tickers(raw)))
     return tickers
 
+# ----------------------------------------------------------------------
+# Main
+# ----------------------------------------------------------------------
+
 def main():
     try:
         tickers = _build_universe()
@@ -404,16 +480,20 @@ def main():
         logging.error(f"Failed to build ticker universe: {e}")
         raise
 
+    # Shuffle once to distribute load; keep deterministic order across restarts if desired
+    random.shuffle(tickers)
+
+    offset = 0
     while True:
         try:
-            conf_signals = scan_tickers(tickers)
+            conf_signals, offset = scan_tickers(tickers, offset=offset, batch_size=SCAN_BATCH_SIZE)
 
             if conf_signals:
                 now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M")
                 msg = f"**✅ EMA Multi-Factor Alerts ({now})**\n" + "\n".join(conf_signals)
                 send_discord_message(msg)
             else:
-                logging.info(f"{datetime.datetime.now():%H:%M} — No signals")
+                logging.info(f"{datetime.datetime.now():%H:%M} — No signals in this batch")
 
             report = evaluate_old_signals()
             if report:

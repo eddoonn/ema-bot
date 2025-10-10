@@ -223,11 +223,26 @@ def scan_tickers(tickers):
                               f"types={[type(v) for v in vals]}")
                 continue
 
-            crossed_up   = prev_fast < prev_slow and ema_fast > ema_slow
-            crossed_down = prev_fast > prev_slow and ema_fast < ema_slow
-            is_above_trend = close > ema_trend
-            is_below_trend = close < ema_trend
-            obv_rising = obv.iloc[-1] > obv.iloc[-5] if len(obv) > 5 else True
+           # --- Safe comparison block ---
+            try:
+                crossed_up   = float(prev_fast) < float(prev_slow) and float(ema_fast) > float(ema_slow)
+                crossed_down = float(prev_fast) > float(prev_slow) and float(ema_fast) < float(ema_slow)
+                is_above_trend = float(close) > float(ema_trend)
+                is_below_trend = float(close) < float(ema_trend)
+            except Exception as e:
+                logging.error(
+                    f"Comparison error for {sym}: {e} | "
+                    f"prev_fast={prev_fast} ({type(prev_fast)}), prev_slow={prev_slow} ({type(prev_slow)}), "
+                    f"ema_fast={ema_fast} ({type(ema_fast)}), ema_slow={ema_slow} ({type(ema_slow)}), "
+                    f"close={close} ({type(close)}), ema_trend={ema_trend} ({type(ema_trend)})"
+                )
+                continue
+            
+            # OBV comparison kept separate
+            try:
+                obv_rising = float(obv.iloc[-1]) > float(obv.iloc[-5]) if len(obv) > 5 else True
+            except Exception:
+                obv_rising = True
 
             if crossed_up and is_above_trend and rsi > 55 and adx > 20 and atr > 0.8 * atr_mean and obv_rising:
                 msg = f"📈 {sym} BUY @ {close:.2f} | RSI {rsi:.1f}, ADX {adx:.1f}"

@@ -20,6 +20,7 @@ import ta
 import numpy as np
 from flask import Flask
 from threading import Thread
+import urllib.request
 
 # ----------------------------------------------------------------------
 # Configuration
@@ -60,11 +61,18 @@ def send_discord_message(content: str):
     except Exception as e:
         logging.error(f"❌ Discord send failed: {e}")
 
+def to_float(x):
+    """Safely convert anything to float or NaN."""
+    try:
+        if isinstance(x, (list, np.ndarray)):
+            x = x[0]
+        return float(x)
+    except Exception:
+        return np.nan
+
 # ----------------------------------------------------------------------
 # Ticker universe fetchers
 # ----------------------------------------------------------------------
-
-import urllib.request
 
 def safe_read_html(url):
     """Fetch HTML with custom User-Agent to avoid 403."""
@@ -110,7 +118,6 @@ def get_nasdaq100_tickers():
 def get_dow30_tickers():
     try:
         tables = safe_read_html("https://en.wikipedia.org/wiki/Dow_Jones_Industrial_Average")
-        # Find table with ticker symbols (the second or third table typically)
         for t in tables:
             cols = [c.lower() for c in t.columns.astype(str)]
             possible_cols = [c for c in cols if "symbol" in c or "ticker" in c]
@@ -122,8 +129,6 @@ def get_dow30_tickers():
     except Exception as e:
         logging.error(f"Dow30 fetch failed: {e}")
         return ["AAPL", "MSFT", "CAT", "BA", "JNJ", "PG", "V"]
-
-
 
 def get_sector_tickers():
     return ["XLE","XLF","XLK","XLV","XLI","XLY","XLU","XLB","XLC","XBI","SMH","SOXX"]
@@ -149,31 +154,16 @@ def fetch_indicators(df):
 def fetch_emas_and_filters(symbol):
     """Download data and compute indicators safely."""
     try:
-        df_daily = yf.download(
-            symbol,
-            period="120d",
-            interval=TIMEFRAME_DAILY,
-            progress=False,
-            auto_adjust=False,
-            threads=False
-        )
+        df_daily = yf.download(symbol, period="120d", interval=TIMEFRAME_DAILY,
+                               progress=False, auto_adjust=False, threads=False)
+        df_4h = yf.download(symbol, period="180d", interval=TIMEFRAME_4H,
+                            progress=False, auto_adjust=False, threads=False)
 
-        df_4h = yf.download(
-            symbol,
-            period="180d",
-            interval=TIMEFRAME_4H,
-            progress=False,
-            auto_adjust=False,
-            threads=False
-        )
-
-        # Flatten possible MultiIndex columns
         if isinstance(df_daily.columns, pd.MultiIndex):
             df_daily.columns = [col[0] for col in df_daily.columns]
         if isinstance(df_4h.columns, pd.MultiIndex):
             df_4h.columns = [col[0] for col in df_4h.columns]
 
-        # Convert to 1D numpy arrays (avoid ndarray issues)
         for col in ["Open", "High", "Low", "Close", "Volume"]:
             if col in df_daily and isinstance(df_daily[col].iloc[0], (np.ndarray, list)):
                 df_daily[col] = df_daily[col].apply(lambda x: x[0] if isinstance(x, (list, np.ndarray)) else x)
@@ -186,13 +176,16 @@ def fetch_emas_and_filters(symbol):
         df_daily = fetch_indicators(df_daily)
         df_daily["ema_fast"] = df_daily["Close"].ewm(span=EMA_FAST).mean()
         df_daily["ema_slow"] = df_daily["Close"].ewm(span=EMA_SLOW).mean()
-        df_4h["ema_trend"]   = df_4h["Close"].ewm(span=EMA_TREND).mean()
+        df_4h["ema_trend"] = df_4h["Close"].ewm(span=EMA_TREND).mean()
 
         ema_trend = float(df_4h["ema_trend"].iloc[-1])
         return df_daily, ema_trend
-
     except Exception as e:
         raise ValueError(f"{symbol}: {e}")
+
+# ----------------------------------------------------------------------
+# Scanner
+# ----------------------------------------------------------------------
 
 def scan_tickers(tickers):
     """Main scanner with full numeric safety and indicator filters."""
@@ -201,13 +194,10 @@ def scan_tickers(tickers):
     for sym in tickers:
         try:
             df, ema_trend = fetch_emas_and_filters(sym)
-
-            # ---- Sanitize dataframe ----
             for col in df.columns:
                 df[col] = df[col].apply(to_float)
             ema_trend = to_float(ema_trend)
 
-            # Retrieve indicator values safely
             prev_fast = to_float(df["ema_fast"].iloc[-2])
             prev_slow = to_float(df["ema_slow"].iloc[-2])
             ema_fast  = to_float(df["ema_fast"].iloc[-1])
@@ -219,27 +209,31 @@ def scan_tickers(tickers):
             atr_mean  = to_float(df["atr"].rolling(100).mean().iloc[-1])
             obv       = df["obv"].copy()
 
-            # Skip invalids
             vals = [prev_fast, prev_slow, ema_fast, ema_slow,
                     close, rsi, adx, atr, atr_mean, ema_trend]
             if any(map(lambda x: pd.isna(x) or np.isnan(x), vals)):
                 logging.warning(f"Skipping {sym}: NaN or invalid numeric data.")
                 continue
 
-            # Define states
+            # --- Diagnostic block ---
+            try:
+                _ = [float(v) for v in vals]
+            except Exception as e:
+                logging.error(f"Type error for {sym}: {e} | "
+                              f"types={[type(v) for v in vals]}")
+                continue
+
             crossed_up   = prev_fast < prev_slow and ema_fast > ema_slow
             crossed_down = prev_fast > prev_slow and ema_fast < ema_slow
             is_above_trend = close > ema_trend
             is_below_trend = close < ema_trend
             obv_rising = obv.iloc[-1] > obv.iloc[-5] if len(obv) > 5 else True
 
-            # --- Long confirmation ---
             if crossed_up and is_above_trend and rsi > 55 and adx > 20 and atr > 0.8 * atr_mean and obv_rising:
                 msg = f"📈 {sym} BUY @ {close:.2f} | RSI {rsi:.1f}, ADX {adx:.1f}"
                 conf_signals.append(msg)
                 record_signal("BUY", sym, close)
 
-            # --- Short confirmation ---
             elif crossed_down and is_below_trend and rsi < 45 and adx > 20 and atr > 0.8 * atr_mean and not obv_rising:
                 msg = f"🔻 {sym} SELL @ {close:.2f} | RSI {rsi:.1f}, ADX {adx:.1f}"
                 conf_signals.append(msg)
@@ -264,7 +258,6 @@ def record_signal(signal_type, sym, price):
         df.to_csv(LOG_FILE, index=False)
 
 def evaluate_old_signals():
-    """After HOLD_DAYS, evaluate past trades."""
     if not os.path.exists(LOG_FILE):
         return None
     df = pd.read_csv(LOG_FILE)
@@ -284,13 +277,15 @@ def evaluate_old_signals():
                 continue
             exit_price = float(df_hist["Close"].iloc[HOLD_DAYS - 1])
             ret = (exit_price - entry) / entry
-            if side == "SELL": ret = -ret
+            if side == "SELL":
+                ret = -ret
             profit = ret * CAPITAL_PER_TRADE
             results.append((sym, side, entry, exit_price, profit))
         except Exception as e:
             logging.error(f"Backtest {sym}: {e}")
 
-    if not results: return None
+    if not results:
+        return None
 
     total = sum(p[4] for p in results)
     winrate = sum(1 for p in results if p[4] > 0) / len(results) * 100

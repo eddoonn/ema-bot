@@ -33,7 +33,7 @@ from pandas.api.types import is_numeric_dtype
 # Configuration (override via env vars on Render)
 # ----------------------------------------------------------------------
 
-DISCORD_WEBHOOK = os.getenv("DISCORD_WEBHOOK", "https://discord.com/api/webhooks/REPLACE_WITH_YOUR_WEBHOOK")
+DISCORD_WEBHOOK = os.getenv("DISCORD_WEBHOOK", "https://discord.com/api/webhooks/1425616478601871400/AMbiCffNSI7lOsqLPBZ5UDPOStNW0UgcAJAqMU0D1QxDzD2EymlnrbTQxN44XErNkaXm")
 
 EMA_FAST  = int(os.getenv("EMA_FAST", 13))
 EMA_SLOW  = int(os.getenv("EMA_SLOW", 21))

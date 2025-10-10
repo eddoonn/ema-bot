@@ -332,19 +332,28 @@ def main():
     logging.info("🚀 EMA Multi-Factor Scanner Started")
 
     while True:
-        conf_signals = scan_tickers(tickers)
+        try:
+            conf_signals = scan_tickers(tickers)
 
-        if conf_signals:
-            msg = f"**✅ EMA Multi-Factor Alerts ({datetime.datetime.now():%Y-%m-%d %H:%M})**\n" + "\n".join(conf_signals)
-            send_discord_message(msg)
-        else:
-            logging.info(f"{datetime.datetime.now():%H:%M} — No signals")
+            if conf_signals:
+                msg = (
+                    f"**✅ EMA Multi-Factor Alerts ({datetime.datetime.now():%Y-%m-%d %H:%M})**\n"
+                    + "\n".join(conf_signals)
+                )
+                send_discord_message(msg)
+            else:
+                logging.info(f"{datetime.datetime.now():%H:%M} — No signals")
 
-        report = evaluate_old_signals()
-        if report:
-            send_discord_message(report)
+            report = evaluate_old_signals()
+            if report:
+                send_discord_message(report)
+
+        except Exception as e:
+            # ← This line will catch *any* stray “int < str” exception
+            logging.error(f"⚠️ Global loop error: {type(e).__name__} — {e}", exc_info=True)
 
         time.sleep(CHECK_INTERVAL)
+
 
 # ----------------------------------------------------------------------
 # Flask server to keep Render alive

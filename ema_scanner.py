@@ -346,20 +346,25 @@ def _extract_ema_trend(df_4h: pd.DataFrame) -> float:
         return np.nan
 
 def _compute_signal_for_df(df_daily: pd.DataFrame, ema_trend_value: float):
+    """
+    Evaluate EMA(13/21) crossovers with multi-factor confirmation
+    and return any BUY/SELL signal with a probabilistic confidence score.
+    """
+
     from pandas.api.types import is_numeric_dtype
 
-    # Ensure numeric
+    # --- Ensure all numeric columns are floats ---
     for col in df_daily.columns:
-        if is_numeric_dtype(df_daily[col]):
-            continue
-        try:
-            df_daily[col] = pd.to_numeric(df_daily[col])
-        except Exception:
-            pass
+        if not is_numeric_dtype(df_daily[col]):
+            try:
+                df_daily[col] = pd.to_numeric(df_daily[col])
+            except Exception:
+                pass
 
     if len(df_daily) < max(EMA_SLOW, 50) or pd.isna(ema_trend_value):
         return None
 
+    # --- Extract key values ---
     prev_fast = to_float(df_daily["ema_fast"].iloc[-2])
     prev_slow = to_float(df_daily["ema_slow"].iloc[-2])
     ema_fast  = to_float(df_daily["ema_fast"].iloc[-1])
@@ -374,42 +379,70 @@ def _compute_signal_for_df(df_daily: pd.DataFrame, ema_trend_value: float):
     if any(pd.isna(v) or (isinstance(v, float) and np.isnan(v)) for v in vals):
         return None
 
-    # Must-haves
+    # --- Core directional logic ---
     crossed_up     = (prev_fast < prev_slow) and (ema_fast > ema_slow)
     crossed_down   = (prev_fast > prev_slow) and (ema_fast < ema_slow)
     is_above_trend = (close > ema_trend_value * TREND_BUF)
     is_below_trend = (close < ema_trend_value / TREND_BUF)
 
-    # Optional OBV vote
+    # --- OBV confirmation (optional) ---
     try:
         obv = df_daily["obv"]
-        obv_rising  = float(obv.iloc[-1]) > float(obv.iloc[-5]) if len(obv) > 5 else True
-        obv_falling = float(obv.iloc[-1]) < float(obv.iloc[-5]) if len(obv) > 5 else True
+        if len(obv) > 5:
+            obv_rising  = float(obv.iloc[-1]) > float(obv.iloc[-5])
+            obv_falling = float(obv.iloc[-1]) < float(obv.iloc[-5])
+        else:
+            obv_rising = obv_falling = True
     except Exception:
         obv_rising = obv_falling = True
 
-    # Build 2-of-3 scores (RSI, ADX, ATR). OBV is optional extra vote.
-    buy_score = 0
-    buy_score += 1 if rsi > RSI_MIN_BUY else 0
-    buy_score += 1 if adx > ADX_MIN else 0
-    buy_score += 1 if atr > ATR_RATIO_MIN * atr_mean else 0
-    if USE_OBV and obv_rising:
-        buy_score += 1
+    # --- Helper for probabilistic confidence ---
+    def _compute_confidence_score(rsi_pass, adx_pass, atr_pass, obv_pass=None):
+        votes = [rsi_pass, adx_pass, atr_pass]
+        if USE_OBV:
+            votes.append(obv_pass)
+        valid = [v for v in votes if v is not None]
+        if not valid:
+            return 0.0
+        return round(sum(valid) / len(valid), 2)
 
-    sell_score = 0
-    sell_score += 1 if rsi < RSI_MAX_SELL else 0
-    sell_score += 1 if adx > ADX_MIN else 0
-    sell_score += 1 if atr > ATR_RATIO_MIN * atr_mean else 0
-    if USE_OBV and obv_falling:
-        sell_score += 1
+    # --- BUY logic ---
+    if crossed_up and is_above_trend:
+        rsi_pass = rsi > RSI_MIN_BUY
+        adx_pass = adx > ADX_MIN
+        atr_pass = atr > ATR_RATIO_MIN * atr_mean
+        obv_pass = obv_rising if USE_OBV else None
 
-    if crossed_up and is_above_trend and buy_score >= CONFIRM_SCORE_BUY:
-        return ("BUY", close, rsi, adx)
+        confirm_score = sum([rsi_pass, adx_pass, atr_pass]) + (int(obv_pass) if USE_OBV else 0)
+        confidence = _compute_confidence_score(rsi_pass, adx_pass, atr_pass, obv_pass)
 
-    if crossed_down and is_below_trend and sell_score >= CONFIRM_SCORE_SELL:
-        return ("SELL", close, rsi, adx)
+        if confirm_score >= CONFIRM_SCORE_BUY:
+            return ("BUY", close, rsi, adx, confidence)
+
+    # --- SELL logic ---
+    if crossed_down and is_below_trend:
+        rsi_pass = rsi < RSI_MAX_SELL
+        adx_pass = adx > ADX_MIN
+        atr_pass = atr > ATR_RATIO_MIN * atr_mean
+        obv_pass = obv_falling if USE_OBV else None
+
+        confirm_score = sum([rsi_pass, adx_pass, atr_pass]) + (int(obv_pass) if USE_OBV else 0)
+        confidence = _compute_confidence_score(rsi_pass, adx_pass, atr_pass, obv_pass)
+
+        if confirm_score >= CONFIRM_SCORE_SELL:
+            return ("SELL", close, rsi, adx, confidence)
 
     return None
+
+    
+def _compute_confidence_score(rsi_pass, adx_pass, atr_pass, obv_pass=None):
+    votes = [rsi_pass, adx_pass, atr_pass]
+    if USE_OBV:
+        votes.append(obv_pass)
+    valid_votes = [v for v in votes if v is not None]
+    if not valid_votes:
+        return 0.0
+    return round(sum(valid_votes) / len(valid_votes), 2)
 
 # ----------------------------------------------------------------------
 # Scanner (batched + chunked)
@@ -442,16 +475,16 @@ def scan_tickers_batched(tickers, *, offset=0, batch_size=SCAN_BATCH_SIZE):
     })
 
     logging.info(
-    f"After this batch: next_offset={next_offset} "
-    f"(~{(next_offset / n) * 100.0:.1f}% of universe covered)"
-)
+        f"After this batch: next_offset={next_offset} "
+        f"(~{(next_offset / n) * 100.0:.1f}% of universe covered)"
+    )
 
-    # Chunked batch downloads
+    # --- Download price data in chunks ---
     try:
         daily_map = _download_batch_chunked(batch, period="120d", interval=TIMEFRAME_DAILY, label="daily")
         if RATE_LIMIT_DELAY > 0:
             time.sleep(RATE_LIMIT_DELAY)
-        h4_map    = _download_batch_chunked(batch, period="180d", interval=TIMEFRAME_4H, label="4h")
+        h4_map = _download_batch_chunked(batch, period="180d", interval=TIMEFRAME_4H, label="4h")
         if RATE_LIMIT_DELAY > 0:
             time.sleep(RATE_LIMIT_DELAY)
     except Exception as e:
@@ -459,16 +492,16 @@ def scan_tickers_batched(tickers, *, offset=0, batch_size=SCAN_BATCH_SIZE):
         logging.warning(f"Batch download failed: {e}")
         return conf_signals, next_offset
 
-    # Evaluate each symbol
+    # --- Evaluate each symbol in the batch ---
     for sym in batch:
         df_daily = daily_map.get(sym)
-        df_4h    = h4_map.get(sym)
+        df_4h = h4_map.get(sym)
 
-        # Fallback single-symbol fetch on None/empty
-        if (df_daily is None) or (df_daily is not None and df_daily.empty):
+        # Fallback single-symbol downloads if missing
+        if (df_daily is None) or df_daily.empty:
             df_daily = _download_single_symbol(sym, period="120d", interval=TIMEFRAME_DAILY, label=f"daily:{sym}")
-        if (df_4h is None) or (df_4h is not None and df_4h.empty):
-            df_4h    = _download_single_symbol(sym, period="180d", interval=TIMEFRAME_4H, label=f"4h:{sym}")
+        if (df_4h is None) or df_4h.empty:
+            df_4h = _download_single_symbol(sym, period="180d", interval=TIMEFRAME_4H, label=f"4h:{sym}")
 
         if df_daily is None or df_daily.empty or df_4h is None or df_4h.empty:
             continue
@@ -485,15 +518,26 @@ def scan_tickers_batched(tickers, *, offset=0, batch_size=SCAN_BATCH_SIZE):
         if sig is None:
             continue
 
-        side, close, rsi, adx = sig
+        # --- Unpack the new return structure ---
+        side, close, rsi, adx, conf = sig
+
+        # --- Format and filter message by confidence threshold ---
+        MIN_CONFIDENCE_ALERT = float(os.getenv("MIN_CONFIDENCE_ALERT", 0.55))  # adjustable via env var
+
+        if conf < MIN_CONFIDENCE_ALERT:
+            logging.info(f"Skipping low-confidence {sym} signal ({conf:.2f})")
+            continue
+
         if side == "BUY":
-            msg = f"📈 {sym} BUY @ {close:.2f} | RSI {rsi:.1f}, ADX {adx:.1f}"
-            conf_signals.append(msg)
+            msg = f"📈 {sym} BUY @ {close:.2f} | RSI {rsi:.1f}, ADX {adx:.1f}, CONF {conf:.2f}"
             record_signal("BUY", sym, close)
         elif side == "SELL":
-            msg = f"🔻 {sym} SELL @ {close:.2f} | RSI {rsi:.1f}, ADX {adx:.1f}"
-            conf_signals.append(msg)
+            msg = f"🔻 {sym} SELL @ {close:.2f} | RSI {rsi:.1f}, ADX {adx:.1f}, CONF {conf:.2f}"
             record_signal("SELL", sym, close)
+        else:
+            continue
+
+        conf_signals.append(msg)
 
     LAST_SCAN_SUMMARY["signals_in_batch"] = len(conf_signals)
     return conf_signals, next_offset

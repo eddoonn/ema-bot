@@ -530,7 +530,7 @@ def scan_tickers_batched(tickers, *, offset=0, batch_size=SCAN_BATCH_SIZE):
         side, close, rsi, adx, conf = sig
 
         # --- Format and filter message by confidence threshold ---
-        MIN_CONFIDENCE_ALERT = float(os.getenv("MIN_CONFIDENCE_ALERT", 0.55))  # adjustable via env var
+        MIN_CONFIDENCE_ALERT = float(os.getenv("MIN_CONFIDENCE_ALERT", 0.40))  # adjustable via env var
 
         if conf < MIN_CONFIDENCE_ALERT:
             logging.info(f"Skipping low-confidence {sym} signal ({conf:.2f})")

@@ -347,13 +347,13 @@ def _extract_ema_trend(df_4h: pd.DataFrame) -> float:
 
 def _compute_signal_for_df(df_daily: pd.DataFrame, ema_trend_value: float):
     """
-    Evaluate EMA(13/21) crossovers with multi-factor confirmation
-    and return any BUY/SELL signal with a probabilistic confidence score.
+    Evaluate EMA(13/21) crossovers with multi-factor confirmation and
+    compute a continuous probabilistic confidence score (0.00–1.00).
     """
 
     from pandas.api.types import is_numeric_dtype
 
-    # --- Ensure all numeric columns are floats ---
+    # --- Ensure numeric columns ---
     for col in df_daily.columns:
         if not is_numeric_dtype(df_daily[col]):
             try:
@@ -364,7 +364,7 @@ def _compute_signal_for_df(df_daily: pd.DataFrame, ema_trend_value: float):
     if len(df_daily) < max(EMA_SLOW, 50) or pd.isna(ema_trend_value):
         return None
 
-    # --- Extract key values ---
+    # --- Extract latest indicator values ---
     prev_fast = to_float(df_daily["ema_fast"].iloc[-2])
     prev_slow = to_float(df_daily["ema_slow"].iloc[-2])
     ema_fast  = to_float(df_daily["ema_fast"].iloc[-1])
@@ -379,7 +379,7 @@ def _compute_signal_for_df(df_daily: pd.DataFrame, ema_trend_value: float):
     if any(pd.isna(v) or (isinstance(v, float) and np.isnan(v)) for v in vals):
         return None
 
-    # --- Core directional logic ---
+    # --- Determine crossover direction and trend filter ---
     crossed_up     = (prev_fast < prev_slow) and (ema_fast > ema_slow)
     crossed_down   = (prev_fast > prev_slow) and (ema_fast < ema_slow)
     is_above_trend = (close > ema_trend_value * TREND_BUF)
@@ -396,53 +396,61 @@ def _compute_signal_for_df(df_daily: pd.DataFrame, ema_trend_value: float):
     except Exception:
         obv_rising = obv_falling = True
 
-    # --- Helper for probabilistic confidence ---
-    def _compute_confidence_score(rsi_pass, adx_pass, atr_pass, obv_pass=None):
-        votes = [rsi_pass, adx_pass, atr_pass]
+    # --- Continuous confidence scoring helper ---
+    def _compute_confidence_score(direction, rsi, adx, atr, atr_mean, obv_rising=None, obv_falling=None):
+        """Compute a continuous confidence score (0–1) based on normalized RSI, ADX, ATR, and optional OBV."""
+        scores = []
+
+        # RSI: distance beyond threshold (0–1 over ~20 points)
+        if direction == "BUY":
+            rsi_score = np.clip((rsi - RSI_MIN_BUY) / 20.0, 0, 1)
+        else:
+            rsi_score = np.clip((RSI_MAX_SELL - rsi) / 20.0, 0, 1)
+        scores.append(rsi_score)
+
+        # ADX: normalized 15–40 range
+        adx_score = np.clip((adx - ADX_MIN) / 25.0, 0, 1)
+        scores.append(adx_score)
+
+        # ATR: volatility ratio relative to mean
+        atr_ratio = atr / max(atr_mean, 1e-8)
+        atr_score = np.clip((atr_ratio - ATR_RATIO_MIN) / (1.5 - ATR_RATIO_MIN), 0, 1)
+        scores.append(atr_score)
+
+        # OBV: optional binary bonus
         if USE_OBV:
-            votes.append(obv_pass)
-        valid = [v for v in votes if v is not None]
-        if not valid:
-            return 0.0
-        return round(sum(valid) / len(valid), 2)
+            if direction == "BUY":
+                scores.append(1.0 if obv_rising else 0.0)
+            else:
+                scores.append(1.0 if obv_falling else 0.0)
+
+        return round(float(np.nanmean(scores)), 2)
 
     # --- BUY logic ---
     if crossed_up and is_above_trend:
+        confidence = _compute_confidence_score("BUY", rsi, adx, atr, atr_mean, obv_rising=obv_rising)
         rsi_pass = rsi > RSI_MIN_BUY
         adx_pass = adx > ADX_MIN
         atr_pass = atr > ATR_RATIO_MIN * atr_mean
-        obv_pass = obv_rising if USE_OBV else None
-
-        confirm_score = sum([rsi_pass, adx_pass, atr_pass]) + (int(obv_pass) if USE_OBV else 0)
-        confidence = _compute_confidence_score(rsi_pass, adx_pass, atr_pass, obv_pass)
+        obv_pass = obv_rising if USE_OBV else True
+        confirm_score = sum([rsi_pass, adx_pass, atr_pass, obv_pass])
 
         if confirm_score >= CONFIRM_SCORE_BUY:
             return ("BUY", close, rsi, adx, confidence)
 
     # --- SELL logic ---
     if crossed_down and is_below_trend:
+        confidence = _compute_confidence_score("SELL", rsi, adx, atr, atr_mean, obv_falling=obv_falling)
         rsi_pass = rsi < RSI_MAX_SELL
         adx_pass = adx > ADX_MIN
         atr_pass = atr > ATR_RATIO_MIN * atr_mean
-        obv_pass = obv_falling if USE_OBV else None
-
-        confirm_score = sum([rsi_pass, adx_pass, atr_pass]) + (int(obv_pass) if USE_OBV else 0)
-        confidence = _compute_confidence_score(rsi_pass, adx_pass, atr_pass, obv_pass)
+        obv_pass = obv_falling if USE_OBV else True
+        confirm_score = sum([rsi_pass, adx_pass, atr_pass, obv_pass])
 
         if confirm_score >= CONFIRM_SCORE_SELL:
             return ("SELL", close, rsi, adx, confidence)
 
     return None
-
-    
-def _compute_confidence_score(rsi_pass, adx_pass, atr_pass, obv_pass=None):
-    votes = [rsi_pass, adx_pass, atr_pass]
-    if USE_OBV:
-        votes.append(obv_pass)
-    valid_votes = [v for v in votes if v is not None]
-    if not valid_votes:
-        return 0.0
-    return round(sum(valid_votes) / len(valid_votes), 2)
 
 # ----------------------------------------------------------------------
 # Scanner (batched + chunked)

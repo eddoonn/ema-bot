@@ -769,6 +769,7 @@ def main():
     LAST_SCAN_SUMMARY["universe_size"] = len(tickers)
 
     offset = 0
+    prev_offset = 0  # NEW: to detect wrap-around (full coverage)
     while True:
         try:
             total_signals = 0
@@ -799,6 +800,14 @@ def main():
             LAST_SCAN_SUMMARY["last_error"] = f"{type(e).__name__}: {e}"
             logging.error(f"⚠️ Global loop error: {type(e).__name__} — {e}")
             traceback.print_exc()
+            
+        # --- NEW: exit after one full pass if requested ---
+        if RUN_ONCE:
+            # When offset wraps (becomes smaller than previous), we've covered the full universe once
+            if offset < prev_offset:
+                logging.info("✅ Completed one full pass through the universe (RUN_ONCE=1). Exiting.")
+                break
+            prev_offset = offset
 
         time.sleep(CHECK_INTERVAL)
 

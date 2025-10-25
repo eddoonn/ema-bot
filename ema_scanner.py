@@ -3,7 +3,7 @@
 # ============================================================
 # Scans S&P500 + NASDAQ100 + Dow30 + Biotech + Sector ETFs
 # Sends Discord alerts for confirmed EMA(13/21) crossovers
-# Uses 4H EMA200 trend filter + RSI/ADX/OBV/ATR confirmations
+# Uses 4H EMA200 trend filter + ADX/OBV/ATR/MACD confirmations
 # Includes 5-day backtest performance summary
 # Batched downloads to reduce Yahoo rate limits
 # ============================================================
@@ -47,23 +47,40 @@ HOLD_DAYS          = int(os.getenv("HOLD_DAYS", 5))
 CAPITAL_PER_TRADE  = float(os.getenv("CAPITAL_PER_TRADE", 500))
 LOG_FILE           = os.getenv("LOG_FILE", "trades_log.csv")
 
-# ---- Confirmation scoring tunables (for "any 2 of 3") ----
-# You can override these in Render → Environment
-RSI_MIN_BUY   = float(os.getenv("RSI_MIN_BUY", 50))    # default 50 (was 55)
-RSI_MAX_SELL  = float(os.getenv("RSI_MAX_SELL", 50))   # default 50 (was 45; 48–50 is common)
-ADX_MIN       = float(os.getenv("ADX_MIN", 15))        # default 15 (was 20)
-ATR_RATIO_MIN = float(os.getenv("ATR_RATIO_MIN", 0.7)) # default 0.7 (was 0.8)
+# ---- Confirmation scoring tunables (legacy RSI vars remain defined but unused) ----
+RSI_MIN_BUY   = float(os.getenv("RSI_MIN_BUY", 50))    # (unused in current logic)
+RSI_MAX_SELL  = float(os.getenv("RSI_MAX_SELL", 50))   # (unused in current logic)
+ADX_MIN       = float(os.getenv("ADX_MIN", 15))        # still used (optional ADX vote)
+ATR_RATIO_MIN = float(os.getenv("ATR_RATIO_MIN", 0.7)) # (unused in current logic)
 
 # Allow a small buffer around the 4h EMA200 trend
 TREND_BUF     = float(os.getenv("TREND_BUF", 0.99))    # 0.99 ≈ allow ~1% below for buys
 
-# Require "any N of 3" confirmations (RSI, ADX, ATR)
+# Require "any N of K" confirmations
 CONFIRM_SCORE_BUY  = int(os.getenv("CONFIRM_SCORE_BUY", 2))
 CONFIRM_SCORE_SELL = int(os.getenv("CONFIRM_SCORE_SELL", 2))
 
 # Optional: count OBV as an extra vote (False by default)
 USE_OBV = os.getenv("USE_OBV", "0") == "1"
 
+# ---- NEW: EMA(21) slope + ATR-z distance thresholds ----
+SLOPE_W          = int(os.getenv("SLOPE_W", 5))             # bars for EMA21 slope
+SLOPE_MIN_BUY    = float(os.getenv("SLOPE_MIN_BUY", 0.003)) # ≈ +0.3% over SLOPE_W bars
+SLOPE_MIN_SELL   = float(os.getenv("SLOPE_MIN_SELL", -0.003)) # ≈ -0.3% over SLOPE_W bars
+
+Z_MIN_BUY        = float(os.getenv("Z_MIN_BUY", -0.5))      # (Close-EMA21)/ATR lower bound (long)
+Z_MAX_BUY        = float(os.getenv("Z_MAX_BUY",  0.8))      # upper bound (avoid chases)
+Z_MIN_SELL       = float(os.getenv("Z_MIN_SELL", -0.8))     # short-side band
+Z_MAX_SELL       = float(os.getenv("Z_MAX_SELL",  0.5))
+
+# ---- NEW: MACD histogram acceleration ----
+MACD_FAST        = int(os.getenv("MACD_FAST", 12))
+MACD_SLOW        = int(os.getenv("MACD_SLOW", 26))
+MACD_SIGNAL      = int(os.getenv("MACD_SIGNAL", 9))
+MACD_ACCEL_BARS  = int(os.getenv("MACD_ACCEL_BARS", 1))   # require rising/falling last N bars
+
+# ---- NEW: Optional ADX as an additional vote ----
+USE_ADX_CONFIRM  = os.getenv("USE_ADX_CONFIRM", "1") == "1"
 
 # scanning cadence
 SCAN_BATCH_SIZE    = int(os.getenv("SCAN_BATCH_SIZE", 150))       # tickers per rotating batch
@@ -230,13 +247,31 @@ def get_sector_tickers():
 
 def fetch_indicators(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
-    df["rsi"] = ta.momentum.RSIIndicator(df["Close"], window=14).rsi()
+    # Removed RSI: no longer used in logic
+
+    # ADX
     adx = ta.trend.ADXIndicator(df["High"], df["Low"], df["Close"], window=14)
     df["adx"] = adx.adx()
+
+    # OBV (optional vote)
     obv = ta.volume.OnBalanceVolumeIndicator(df["Close"], df["Volume"])
     df["obv"] = obv.on_balance_volume()
+
+    # ATR (for z-distance and risk/confidence)
     atr = ta.volatility.AverageTrueRange(df["High"], df["Low"], df["Close"], window=14)
     df["atr"] = atr.average_true_range()
+
+    # NEW: MACD and histogram (acceleration)
+    macd = ta.trend.MACD(
+        close=df["Close"],
+        window_slow=MACD_SLOW,
+        window_fast=MACD_FAST,
+        window_sign=MACD_SIGNAL
+    )
+    df["macd"]        = macd.macd()
+    df["macd_signal"] = macd.macd_signal()
+    df["macd_hist"]   = macd.macd_diff()
+
     return df
 
 def _to_numeric_cols(df: pd.DataFrame, cols):
@@ -347,13 +382,15 @@ def _extract_ema_trend(df_4h: pd.DataFrame) -> float:
 
 def _compute_signal_for_df(df_daily: pd.DataFrame, ema_trend_value: float):
     """
-    Evaluate EMA(13/21) crossovers with multi-factor confirmation and
-    compute a continuous probabilistic confidence score (0.00–1.00).
+    EMA(13/21) crossover with:
+      - Slope+Distance confirmation (EMA21 slope over SLOPE_W bars + ATR-z distance band)
+      - MACD histogram acceleration confirmation
+      - Optional OBV vote (if USE_OBV=1)
+      - Optional ADX vote (if USE_ADX_CONFIRM=1)
+    Returns: ("BUY"/"SELL", close, adx, confidence) or None
     """
 
-    from pandas.api.types import is_numeric_dtype
-
-    # --- Ensure numeric columns ---
+    # Ensure numeric
     for col in df_daily.columns:
         if not is_numeric_dtype(df_daily[col]):
             try:
@@ -364,91 +401,143 @@ def _compute_signal_for_df(df_daily: pd.DataFrame, ema_trend_value: float):
     if len(df_daily) < max(EMA_SLOW, 50) or pd.isna(ema_trend_value):
         return None
 
-    # --- Extract latest indicator values ---
+    # --- Latest values ---
     prev_fast = to_float(df_daily["ema_fast"].iloc[-2])
     prev_slow = to_float(df_daily["ema_slow"].iloc[-2])
     ema_fast  = to_float(df_daily["ema_fast"].iloc[-1])
     ema_slow  = to_float(df_daily["ema_slow"].iloc[-1])
     close     = to_float(df_daily["Close"].iloc[-1])
-    rsi       = to_float(df_daily["rsi"].iloc[-1])
     adx       = to_float(df_daily["adx"].iloc[-1])
     atr       = to_float(df_daily["atr"].iloc[-1])
+    # rolling(100) may be NaN on short histories; handle safely in normalization
     atr_mean  = to_float(df_daily["atr"].rolling(100).mean().iloc[-1])
+    macd_hist = df_daily["macd_hist"].values
 
-    vals = [prev_fast, prev_slow, ema_fast, ema_slow, close, rsi, adx, atr, atr_mean, ema_trend_value]
+    vals = [prev_fast, prev_slow, ema_fast, ema_slow, close, adx, atr, ema_trend_value]
     if any(pd.isna(v) or (isinstance(v, float) and np.isnan(v)) for v in vals):
         return None
+    if len(macd_hist) < (MACD_ACCEL_BARS + 2) or len(df_daily) <= SLOPE_W:
+        return None
 
-    # --- Determine crossover direction and trend filter ---
-    crossed_up     = (prev_fast < prev_slow) and (ema_fast > ema_slow)
-    crossed_down   = (prev_fast > prev_slow) and (ema_fast < ema_slow)
+    # --- Trend (regime) gates vs "trend EMA" ---
     is_above_trend = (close > ema_trend_value * TREND_BUF)
     is_below_trend = (close < ema_trend_value / TREND_BUF)
 
-    # --- OBV confirmation (optional) ---
-    try:
-        obv = df_daily["obv"]
-        if len(obv) > 5:
-            obv_rising  = float(obv.iloc[-1]) > float(obv.iloc[-5])
-            obv_falling = float(obv.iloc[-1]) < float(obv.iloc[-5])
-        else:
-            obv_rising = obv_falling = True
-    except Exception:
-        obv_rising = obv_falling = True
+    # --- Cross directions ---
+    crossed_up   = (prev_fast <= prev_slow) and (ema_fast > ema_slow)
+    crossed_down = (prev_fast >= prev_slow) and (ema_fast < ema_slow)
 
-    # --- Continuous confidence scoring helper ---
-    def _compute_confidence_score(direction, rsi, adx, atr, atr_mean, obv_rising=None, obv_falling=None):
-        """Compute a continuous confidence score (0–1) based on normalized RSI, ADX, ATR, and optional OBV."""
-        scores = []
+    # --- Slope+Distance (EMA21 slope over SLOPE_W bars + ATR-z) ---
+    ema_slow_t   = float(df_daily["ema_slow"].iloc[-1])
+    ema_slow_tmW = float(df_daily["ema_slow"].iloc[-SLOPE_W])
+    slope_21     = (ema_slow_t / ema_slow_tmW - 1.0) if ema_slow_tmW else 0.0
+    z_dist       = (close - ema_slow_t) / max(atr, 1e-8)
 
-        # RSI: distance beyond threshold (0–1 over ~20 points)
-        if direction == "BUY":
-            rsi_score = np.clip((rsi - RSI_MIN_BUY) / 20.0, 0, 1)
-        else:
-            rsi_score = np.clip((RSI_MAX_SELL - rsi) / 20.0, 0, 1)
-        scores.append(rsi_score)
+    slope_dist_buy  = (slope_21 >  SLOPE_MIN_BUY)  and (Z_MIN_BUY  <= z_dist <= Z_MAX_BUY)
+    slope_dist_sell = (slope_21 <  SLOPE_MIN_SELL) and (Z_MIN_SELL <= z_dist <= Z_MAX_SELL)
 
-        # ADX: normalized 15–40 range
-        adx_score = np.clip((adx - ADX_MIN) / 25.0, 0, 1)
-        scores.append(adx_score)
-
-        # ATR: volatility ratio relative to mean
-        atr_ratio = atr / max(atr_mean, 1e-8)
-        atr_score = np.clip((atr_ratio - ATR_RATIO_MIN) / (1.5 - ATR_RATIO_MIN), 0, 1)
-        scores.append(atr_score)
-
-        # OBV: optional binary bonus
-        if USE_OBV:
-            if direction == "BUY":
-                scores.append(1.0 if obv_rising else 0.0)
+    # --- MACD histogram acceleration ---
+    def _macd_accel_ok(long_side: bool):
+        n = MACD_ACCEL_BARS
+        for i in range(1, n + 1):
+            h0 = float(macd_hist[-i])
+            h1 = float(macd_hist[-i - 1])
+            if long_side:
+                if not (h0 > 0 and h0 > h1):
+                    return False
             else:
-                scores.append(1.0 if obv_falling else 0.0)
+                if not (h0 < 0 and h0 < h1):
+                    return False
+        return True
 
-        return round(float(np.nanmean(scores)), 2)
+    macd_accel_buy  = _macd_accel_ok(True)
+    macd_accel_sell = _macd_accel_ok(False)
 
-    # --- BUY logic ---
+    # --- Optional ADX vote ---
+    adx_pass = (adx > ADX_MIN) if USE_ADX_CONFIRM else None
+
+    # --- Confidence scoring helpers ---
+    def _slope_score(slope, min_thr, side):
+        if side == "BUY":
+            return float(np.clip((slope - min_thr) / max(2*abs(min_thr), 1e-8), 0, 1))
+        else:
+            # more negative is better
+            return float(np.clip((abs(slope) - abs(min_thr)) / max(2*abs(min_thr), 1e-8), 0, 1))
+
+    def _z_score(z, lo, hi):
+        mid = 0.5 * (lo + hi)
+        half = 0.5 * (hi - lo)
+        if half <= 0:
+            return 0.0
+        return float(np.clip(1.0 - abs(z - mid) / half, 0, 1))
+
+    def _macd_score(long_side: bool):
+        n = MACD_ACCEL_BARS
+        deltas = []
+        for i in range(1, n + 1):
+            h0 = float(macd_hist[-i]); h1 = float(macd_hist[-i-1])
+            d = h0 - h1
+            deltas.append(max(d, 0) if long_side else max(-d, 0))
+        # Safe normalization independent of ATR scale; fallback if atr_mean is NaN/0
+        denom_base = atr_mean if (atr_mean is not None and np.isfinite(atr_mean) and atr_mean > 0) else 1.0
+        denom = 0.5 * denom_base
+        base = max(float(np.mean(deltas)), 0.0)
+        return float(np.clip(base / max(denom, 1e-8), 0, 1))
+
+    def _adx_score(a):
+        return float(np.clip((a - ADX_MIN) / 25.0, 0, 1))
+
+    # -------------- BUY logic --------------
     if crossed_up and is_above_trend:
-        confidence = _compute_confidence_score("BUY", rsi, adx, atr, atr_mean, obv_rising=obv_rising)
-        rsi_pass = rsi > RSI_MIN_BUY
-        adx_pass = adx > ADX_MIN
-        atr_pass = atr > ATR_RATIO_MIN * atr_mean
-        obv_pass = obv_rising if USE_OBV else True
-        confirm_score = sum([rsi_pass, adx_pass, atr_pass, obv_pass])
+        votes = [slope_dist_buy, macd_accel_buy]
+        if USE_OBV:
+            try:
+                obv = df_daily["obv"]
+                obv_rising = float(obv.iloc[-1]) > float(obv.iloc[-5]) if len(obv) > 5 else True
+            except Exception:
+                obv_rising = True
+            votes.append(obv_rising)
+        if USE_ADX_CONFIRM:
+            votes.append(adx_pass)
+
+        confirm_score = sum(bool(v) for v in votes)
 
         if confirm_score >= CONFIRM_SCORE_BUY:
-            return ("BUY", close, rsi, adx, confidence)
+            c_parts = [
+                _slope_score(slope_21, SLOPE_MIN_BUY, "BUY"),
+                _z_score(z_dist, Z_MIN_BUY, Z_MAX_BUY),
+                _macd_score(True),
+            ]
+            if USE_ADX_CONFIRM:
+                c_parts.append(_adx_score(adx))
+            confidence = round(float(np.nanmean(c_parts)), 2)
+            return ("BUY", close, adx, confidence)
 
-    # --- SELL logic ---
+    # -------------- SELL logic --------------
     if crossed_down and is_below_trend:
-        confidence = _compute_confidence_score("SELL", rsi, adx, atr, atr_mean, obv_falling=obv_falling)
-        rsi_pass = rsi < RSI_MAX_SELL
-        adx_pass = adx > ADX_MIN
-        atr_pass = atr > ATR_RATIO_MIN * atr_mean
-        obv_pass = obv_falling if USE_OBV else True
-        confirm_score = sum([rsi_pass, adx_pass, atr_pass, obv_pass])
+        votes = [slope_dist_sell, macd_accel_sell]
+        if USE_OBV:
+            try:
+                obv = df_daily["obv"]
+                obv_falling = float(obv.iloc[-1]) < float(obv.iloc[-5]) if len(obv) > 5 else True
+            except Exception:
+                obv_falling = True
+            votes.append(obv_falling)
+        if USE_ADX_CONFIRM:
+            votes.append(adx_pass)
+
+        confirm_score = sum(bool(v) for v in votes)
 
         if confirm_score >= CONFIRM_SCORE_SELL:
-            return ("SELL", close, rsi, adx, confidence)
+            c_parts = [
+                _slope_score(slope_21, abs(SLOPE_MIN_SELL), "SELL"),
+                _z_score(z_dist, Z_MIN_SELL, Z_MAX_SELL),
+                _macd_score(False),
+            ]
+            if USE_ADX_CONFIRM:
+                c_parts.append(_adx_score(adx))
+            confidence = round(float(np.nanmean(c_parts)), 2)
+            return ("SELL", close, adx, confidence)
 
     return None
 
@@ -527,7 +616,7 @@ def scan_tickers_batched(tickers, *, offset=0, batch_size=SCAN_BATCH_SIZE):
             continue
 
         # --- Unpack the new return structure ---
-        side, close, rsi, adx, conf = sig
+        side, close, adx, conf = sig
 
         # --- Format and filter message by confidence threshold ---
         MIN_CONFIDENCE_ALERT = float(os.getenv("MIN_CONFIDENCE_ALERT", 0.40))  # adjustable via env var
@@ -537,10 +626,10 @@ def scan_tickers_batched(tickers, *, offset=0, batch_size=SCAN_BATCH_SIZE):
             continue
 
         if side == "BUY":
-            msg = f"📈 {sym} BUY @ {close:.2f} | RSI {rsi:.1f}, ADX {adx:.1f}, CONF {conf:.2f}"
+            msg = f"📈 {sym} BUY @ {close:.2f} | ADX {adx:.1f}, CONF {conf:.2f}"
             record_signal("BUY", sym, close)
         elif side == "SELL":
-            msg = f"🔻 {sym} SELL @ {close:.2f} | RSI {rsi:.1f}, ADX {adx:.1f}, CONF {conf:.2f}"
+            msg = f"🔻 {sym} SELL @ {close:.2f} | ADX {adx:.1f}, CONF {conf:.2f}"
             record_signal("SELL", sym, close)
         else:
             continue
@@ -724,3 +813,5 @@ if __name__ == "__main__":
     except Exception as e:
         logging.error(f"Fatal error: {e}")
         traceback.print_exc()
+
+

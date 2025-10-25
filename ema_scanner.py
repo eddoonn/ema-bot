@@ -65,19 +65,19 @@ USE_OBV = os.getenv("USE_OBV", "0") == "1"
 
 # ---- NEW: EMA(21) slope + ATR-z distance thresholds ----
 SLOPE_W          = int(os.getenv("SLOPE_W", 5))             # bars for EMA21 slope
-SLOPE_MIN_BUY    = float(os.getenv("SLOPE_MIN_BUY", 0.003)) # ≈ +0.3% over SLOPE_W bars
-SLOPE_MIN_SELL   = float(os.getenv("SLOPE_MIN_SELL", -0.003)) # ≈ -0.3% over SLOPE_W bars
+SLOPE_MIN_BUY    = float(os.getenv("SLOPE_MIN_BUY", 0.004)) # ≈ +0.3% over SLOPE_W bars
+SLOPE_MIN_SELL   = float(os.getenv("SLOPE_MIN_SELL", -0.004)) # ≈ -0.3% over SLOPE_W bars
 
-Z_MIN_BUY        = float(os.getenv("Z_MIN_BUY", -0.5))      # (Close-EMA21)/ATR lower bound (long)
-Z_MAX_BUY        = float(os.getenv("Z_MAX_BUY",  0.8))      # upper bound (avoid chases)
-Z_MIN_SELL       = float(os.getenv("Z_MIN_SELL", -0.8))     # short-side band
-Z_MAX_SELL       = float(os.getenv("Z_MAX_SELL",  0.5))
+Z_MIN_BUY        = float(os.getenv("Z_MIN_BUY", -0.4))      # (Close-EMA21)/ATR lower bound (long)
+Z_MAX_BUY        = float(os.getenv("Z_MAX_BUY",  0.4))      # upper bound (avoid chases)
+Z_MIN_SELL       = float(os.getenv("Z_MIN_SELL", -0.4))     # short-side band
+Z_MAX_SELL       = float(os.getenv("Z_MAX_SELL",  0.4))
 
 # ---- NEW: MACD histogram acceleration ----
 MACD_FAST        = int(os.getenv("MACD_FAST", 12))
 MACD_SLOW        = int(os.getenv("MACD_SLOW", 26))
 MACD_SIGNAL      = int(os.getenv("MACD_SIGNAL", 9))
-MACD_ACCEL_BARS  = int(os.getenv("MACD_ACCEL_BARS", 1))   # require rising/falling last N bars
+MACD_ACCEL_BARS  = int(os.getenv("MACD_ACCEL_BARS", 2))   # require rising/falling last N bars
 
 # ---- NEW: Optional ADX as an additional vote ----
 USE_ADX_CONFIRM  = os.getenv("USE_ADX_CONFIRM", "1") == "1"

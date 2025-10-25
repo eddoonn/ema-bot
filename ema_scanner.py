@@ -34,6 +34,9 @@ from pandas.api.types import is_numeric_dtype
 # ----------------------------------------------------------------------
 
 DISCORD_WEBHOOK = os.getenv("DISCORD_WEBHOOK", "https://discord.com/api/webhooks/1425616478601871400/AMbiCffNSI7lOsqLPBZ5UDPOStNW0UgcAJAqMU0D1QxDzD2EymlnrbTQxN44XErNkaXm")
+# run mode
+RUN_ONCE = os.getenv("RUN_ONCE", "0") == "1"  # if 1, exit after one full pass through universe
+
 
 EMA_FAST  = int(os.getenv("EMA_FAST", 13))
 EMA_SLOW  = int(os.getenv("EMA_SLOW", 21))

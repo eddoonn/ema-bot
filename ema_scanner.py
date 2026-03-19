@@ -33,7 +33,7 @@ from pandas.api.types import is_numeric_dtype
 # Configuration (override via env vars on Render)
 # ----------------------------------------------------------------------
 
-DISCORD_WEBHOOK = os.getenv("DISCORD_WEBHOOK", "https://discord.com/api/webhooks/1425616478601871400/AMbiCffNSI7lOsqLPBZ5UDPOStNW0UgcAJAqMU0D1QxDzD2EymlnrbTQxN44XErNkaXm")
+DISCORD_WEBHOOK = os.getenv("DISCORD_WEBHOOK", "https://discord.com/api/webhooks/1484339013677748235/UlOGfiBHOshhohrYZzl6vZAVBDkW5Nt_YL6hLBelJq0dg4afxhZfE_XiuVt6o5mq9wW2")
 # run mode
 RUN_ONCE = os.getenv("RUN_ONCE", "0") == "1"  # if 1, exit after one full pass through universe
 

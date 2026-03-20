@@ -17,7 +17,7 @@ import random
 import logging
 import datetime
 import traceback
-import urllib.request
+from io import StringIO
 from threading import Thread
 
 import numpy as np
@@ -171,11 +171,10 @@ def normalize_tickers(seq):
     return out
 
 def safe_read_html(url):
-    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
-    req = urllib.request.Request(url, headers=headers)
-    with urllib.request.urlopen(req, timeout=20) as resp:
-        html = resp.read()
-    return pd.read_html(html)
+    headers = {"User-Agent": "Mozilla/5.0"}
+    resp = requests.get(url, headers=headers, timeout=20)
+    resp.raise_for_status()
+    return pd.read_html(StringIO(resp.text))
 
 def _sleep_backoff(attempt: int):
     wait = (BACKOFF_BASE ** attempt) + random.random() * BACKOFF_JITTER_MAX
@@ -825,5 +824,4 @@ if __name__ == "__main__":
     except Exception as e:
         logging.error(f"Fatal error: {e}")
         traceback.print_exc()
-
 

@@ -35,34 +35,29 @@ from pandas.api.types import is_numeric_dtype
 
 DISCORD_WEBHOOK = os.getenv("DISCORD_WEBHOOK")
 
-# run mode
-RUN_ONCE = os.getenv("RUN_ONCE", "0") == "1"  # if 1, exit after one full pass through universe
+RUN_ONCE = os.getenv("RUN_ONCE", "0") == "1"
 
 EMA_FAST  = int(os.getenv("EMA_FAST", 13))
 EMA_SLOW  = int(os.getenv("EMA_SLOW", 21))
 EMA_TREND = int(os.getenv("EMA_TREND", 200))
 
 TIMEFRAME_DAILY   = os.getenv("TIMEFRAME_DAILY", "1d")
-TIMEFRAME_4H_BASE = os.getenv("TIMEFRAME_4H_BASE", "1h")   # fetch hourly from Yahoo
-RESAMPLE_4H_RULE  = os.getenv("RESAMPLE_4H_RULE", "4h")    # build 4H candles locally
+TIMEFRAME_4H_BASE = os.getenv("TIMEFRAME_4H_BASE", "1h")
+RESAMPLE_4H_RULE  = os.getenv("RESAMPLE_4H_RULE", "4h")
 
 CHECK_INTERVAL     = int(os.getenv("CHECK_INTERVAL", 120))
 HOLD_DAYS          = int(os.getenv("HOLD_DAYS", 5))
 CAPITAL_PER_TRADE  = float(os.getenv("CAPITAL_PER_TRADE", 500))
 LOG_FILE           = os.getenv("LOG_FILE", "trades_log.csv")
 
-# ---- Confirmation scoring tunables ----
 ADX_MIN       = float(os.getenv("ADX_MIN", 15))
 TREND_BUF     = float(os.getenv("TREND_BUF", 0.99))
 
-# Require "any N of K" confirmations
 CONFIRM_SCORE_BUY  = int(os.getenv("CONFIRM_SCORE_BUY", 2))
 CONFIRM_SCORE_SELL = int(os.getenv("CONFIRM_SCORE_SELL", 2))
 
-# Optional: count OBV as an extra vote
 USE_OBV = os.getenv("USE_OBV", "0") == "1"
 
-# ---- EMA(21) slope + ATR-z distance thresholds ----
 SLOPE_W          = int(os.getenv("SLOPE_W", 5))
 SLOPE_MIN_BUY    = float(os.getenv("SLOPE_MIN_BUY", 0.004))
 SLOPE_MIN_SELL   = float(os.getenv("SLOPE_MIN_SELL", -0.004))
@@ -72,30 +67,24 @@ Z_MAX_BUY        = float(os.getenv("Z_MAX_BUY",  0.4))
 Z_MIN_SELL       = float(os.getenv("Z_MIN_SELL", -0.4))
 Z_MAX_SELL       = float(os.getenv("Z_MAX_SELL",  0.4))
 
-# ---- MACD histogram acceleration ----
 MACD_FAST        = int(os.getenv("MACD_FAST", 12))
 MACD_SLOW        = int(os.getenv("MACD_SLOW", 26))
 MACD_SIGNAL      = int(os.getenv("MACD_SIGNAL", 9))
 MACD_ACCEL_BARS  = int(os.getenv("MACD_ACCEL_BARS", 2))
 
-# ---- Optional ADX as an additional vote ----
 USE_ADX_CONFIRM  = os.getenv("USE_ADX_CONFIRM", "1") == "1"
 
-# scanning cadence
 SCAN_BATCH_SIZE    = int(os.getenv("SCAN_BATCH_SIZE", 150))
 BATCHES_PER_LOOP   = int(os.getenv("BATCHES_PER_LOOP", 1))
 BATCH_PAUSE        = float(os.getenv("BATCH_PAUSE", 3.0))
 
-# rate-limit / resiliency
 MAX_RETRIES        = int(os.getenv("MAX_RETRIES", 3))
 BACKOFF_BASE       = float(os.getenv("BACKOFF_BASE", 1.7))
 BACKOFF_JITTER_MAX = float(os.getenv("BACKOFF_JITTER_MAX", 0.35))
 RATE_LIMIT_DELAY   = float(os.getenv("RATE_LIMIT_DELAY", 0.0))
 
-# yfinance chunking inside a batch
 YF_BATCH_CHUNK     = int(os.getenv("YF_BATCH_CHUNK", 50))
 
-# logging
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s - %(message)s",
@@ -149,20 +138,6 @@ def _normalize_ticker(x):
     if not s:
         return None
     s = s.split()[0]
-    s = s.replace(".", "-")  # BRK.B -> BRK-B for Yahoo
-    if not re.fullmatch(r"[A-Z0-9\-]+", s):
-        return None
-    if len(s) > 12:
-        return None
-    return s
-
-def _normalize_ticker(x):
-    if x is None:
-        return None
-    s = str(x).strip().upper()
-    if not s:
-        return None
-    s = s.split()[0]
     s = s.replace(".", "-")
     if not re.fullmatch(r"[A-Z0-9\-]+", s):
         return None
@@ -171,6 +146,14 @@ def _normalize_ticker(x):
     if len(s) > 12:
         return None
     return s
+
+def normalize_tickers(seq):
+    out = []
+    for x in seq:
+        s = _normalize_ticker(x)
+        if s:
+            out.append(s)
+    return out
 
 def safe_read_html(url):
     headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
@@ -183,6 +166,12 @@ def _sleep_backoff(attempt: int):
     wait = (BACKOFF_BASE ** attempt) + random.random() * BACKOFF_JITTER_MAX
     time.sleep(wait)
 
+def _to_numeric_cols(df: pd.DataFrame, cols):
+    for c in cols:
+        if c in df.columns:
+            df[c] = pd.to_numeric(df[c], errors="coerce")
+    return df
+
 # ----------------------------------------------------------------------
 # Universe fetchers
 # ----------------------------------------------------------------------
@@ -191,7 +180,7 @@ def get_sp500_tickers():
     try:
         tables = safe_read_html("https://en.wikipedia.org/wiki/List_of_S%26P_500_companies")
         df = tables[0]
-        tickers = df["Symbol"].astype(str).tolist()
+        tickers = normalize_tickers(df["Symbol"].astype(str).tolist())
         logging.info(f"Loaded {len(tickers)} S&P 500 tickers from Wikipedia.")
         return tickers
     except Exception as e:
@@ -215,7 +204,6 @@ def get_biotech_tickers():
                     return tickers[:100]
 
         raise ValueError("No ticker-like column found in biotech table.")
-
     except Exception as e:
         logging.error(f"Biotech list error: {e}")
         return ["BIIB","REGN","VRTX","GILD","ALNY","ILMN"]
@@ -232,7 +220,7 @@ def get_nasdaq100_tickers():
             df = tables[4]
         if df is None:
             raise ValueError("No NASDAQ-100 table with 'Ticker' column found.")
-        tickers = df["Ticker"].dropna().astype(str).tolist()
+        tickers = normalize_tickers(df["Ticker"].dropna().astype(str).tolist())
         logging.info(f"Loaded {len(tickers)} NASDAQ-100 tickers from Wikipedia.")
         return tickers
     except Exception as e:
@@ -247,7 +235,7 @@ def get_dow30_tickers():
             possible_cols = [c for c in cols if "symbol" in c or "ticker" in c]
             if possible_cols:
                 idx = cols.index(possible_cols[0])
-                tickers = t[t.columns[idx]].dropna().astype(str).tolist()
+                tickers = normalize_tickers(t[t.columns[idx]].dropna().astype(str).tolist())
                 logging.info(f"Loaded {len(tickers)} Dow 30 tickers from Wikipedia.")
                 return tickers
         raise ValueError("No symbol/ticker column found.")
@@ -286,12 +274,6 @@ def fetch_indicators(df: pd.DataFrame) -> pd.DataFrame:
 
     return df
 
-def _to_numeric_cols(df: pd.DataFrame, cols):
-    for c in cols:
-        if c in df.columns:
-            df[c] = pd.to_numeric(df[c], errors="coerce")
-    return df
-
 # ----------------------------------------------------------------------
 # 1H -> TRUE 4H resampling
 # ----------------------------------------------------------------------
@@ -306,9 +288,7 @@ def resample_to_4h(df: pd.DataFrame) -> pd.DataFrame:
         out.index = pd.to_datetime(out.index, errors="coerce")
 
     out = out[~out.index.isna()].sort_index()
-
-    needed = ["Open", "High", "Low", "Close", "Volume"]
-    out = _to_numeric_cols(out, needed)
+    out = _to_numeric_cols(out, ["Open", "High", "Low", "Close", "Volume"])
 
     agg = {
         "Open": "first",
@@ -327,7 +307,7 @@ def resample_to_4h(df: pd.DataFrame) -> pd.DataFrame:
     return out
 
 # ----------------------------------------------------------------------
-# Batch downloads (CHUNKED) to reduce rate limits
+# Batch downloads
 # ----------------------------------------------------------------------
 
 def _download_batch_chunked(tickers, *, period, interval, label):
@@ -361,7 +341,6 @@ def _download_batch_chunked(tickers, *, period, interval, label):
                             else:
                                 merged[t] = None
                     else:
-                        # Single-symbol response
                         merged[chunk[0]] = df
                         for t in chunk[1:]:
                             merged[t] = None
@@ -426,8 +405,7 @@ def _prepare_daily_df(df_daily: pd.DataFrame) -> pd.DataFrame:
     if df_daily is None or df_daily.empty:
         return None
 
-    cols = ["Open", "High", "Low", "Close", "Volume"]
-    df_daily = _to_numeric_cols(df_daily.copy(), cols)
+    df_daily = _to_numeric_cols(df_daily.copy(), ["Open", "High", "Low", "Close", "Volume"])
 
     try:
         df_daily = fetch_indicators(df_daily)
@@ -588,7 +566,7 @@ def _compute_signal_for_df(df_daily: pd.DataFrame, ema_trend_value: float):
     return None
 
 # ----------------------------------------------------------------------
-# Scanner (batched + chunked)
+# Scanner
 # ----------------------------------------------------------------------
 
 def scan_tickers_batched(tickers, *, offset=0, batch_size=SCAN_BATCH_SIZE):
@@ -777,7 +755,7 @@ def _build_universe():
     return sorted(set(normalize_tickers(raw)))
 
 # ----------------------------------------------------------------------
-# Flask (keep-alive + health)
+# Flask
 # ----------------------------------------------------------------------
 
 app = Flask(__name__)

@@ -43,7 +43,7 @@ EMA_SLOW  = int(os.getenv("EMA_SLOW", 21))
 EMA_TREND = int(os.getenv("EMA_TREND", 200))
 
 TIMEFRAME_DAILY = os.getenv("TIMEFRAME_DAILY", "1d")
-TIMEFRAME_4H    = os.getenv("TIMEFRAME_4H", "1h")
+TIMEFRAME_4H    = os.getenv("TIMEFRAME_4H", "4h")
 
 CHECK_INTERVAL     = int(os.getenv("CHECK_INTERVAL", 120))       # sleep between loops
 HOLD_DAYS          = int(os.getenv("HOLD_DAYS", 5))

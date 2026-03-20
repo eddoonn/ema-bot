@@ -12,13 +12,12 @@
 import os
 import re
 import time
-import math
-import json
 import random
 import logging
 import datetime
 import traceback
 import urllib.request
+from io import StringIO
 from threading import Thread
 
 import numpy as np
@@ -47,19 +46,14 @@ TIMEFRAME_DAILY   = os.getenv("TIMEFRAME_DAILY", "1d")
 TIMEFRAME_4H_BASE = os.getenv("TIMEFRAME_4H_BASE", "1h")   # fetch hourly from Yahoo
 RESAMPLE_4H_RULE  = os.getenv("RESAMPLE_4H_RULE", "4h")    # build 4H candles locally
 
-CHECK_INTERVAL     = int(os.getenv("CHECK_INTERVAL", 120))       # sleep between loops
+CHECK_INTERVAL     = int(os.getenv("CHECK_INTERVAL", 120))
 HOLD_DAYS          = int(os.getenv("HOLD_DAYS", 5))
 CAPITAL_PER_TRADE  = float(os.getenv("CAPITAL_PER_TRADE", 500))
 LOG_FILE           = os.getenv("LOG_FILE", "trades_log.csv")
 
 # ---- Confirmation scoring tunables ----
-RSI_MIN_BUY   = float(os.getenv("RSI_MIN_BUY", 50))    # unused
-RSI_MAX_SELL  = float(os.getenv("RSI_MAX_SELL", 50))   # unused
 ADX_MIN       = float(os.getenv("ADX_MIN", 15))
-ATR_RATIO_MIN = float(os.getenv("ATR_RATIO_MIN", 0.7)) # unused
-
-# Allow a small buffer around the 4h EMA200 trend
-TREND_BUF     = float(os.getenv("TREND_BUF", 0.99))    # 0.99 ≈ allow ~1% below for buys
+TREND_BUF     = float(os.getenv("TREND_BUF", 0.99))
 
 # Require "any N of K" confirmations
 CONFIRM_SCORE_BUY  = int(os.getenv("CONFIRM_SCORE_BUY", 2))
@@ -108,8 +102,6 @@ logging.basicConfig(
     datefmt="%Y-%m-%d %H:%M"
 )
 logger = logging.getLogger(__name__)
-
-# quiet yfinance's own "Failed download" lines
 logging.getLogger("yfinance").setLevel(logging.ERROR)
 
 # ----------------------------------------------------------------------
@@ -176,8 +168,8 @@ def safe_read_html(url):
     headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
     req = urllib.request.Request(url, headers=headers)
     with urllib.request.urlopen(req, timeout=20) as resp:
-        html = resp.read()
-    return pd.read_html(html)
+        html = resp.read().decode("utf-8", errors="ignore")
+    return pd.read_html(StringIO(html))
 
 def _sleep_backoff(attempt: int):
     wait = (BACKOFF_BASE ** attempt) + random.random() * BACKOFF_JITTER_MAX
@@ -232,10 +224,11 @@ def get_dow30_tickers():
     try:
         tables = safe_read_html("https://en.wikipedia.org/wiki/Dow_Jones_Industrial_Average")
         for t in tables:
-            cols = [c.lower() for c in t.columns.astype(str)]
+            cols = [str(c).lower() for c in t.columns]
             possible_cols = [c for c in cols if "symbol" in c or "ticker" in c]
             if possible_cols:
-                tickers = t[t.columns[cols.index(possible_cols[0])]].dropna().astype(str).tolist()
+                idx = cols.index(possible_cols[0])
+                tickers = t[t.columns[idx]].dropna().astype(str).tolist()
                 logging.info(f"Loaded {len(tickers)} Dow 30 tickers from Wikipedia.")
                 return tickers
         raise ValueError("No symbol/ticker column found.")
@@ -253,19 +246,15 @@ def get_sector_tickers():
 def fetch_indicators(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
 
-    # ADX
     adx = ta.trend.ADXIndicator(df["High"], df["Low"], df["Close"], window=14)
     df["adx"] = adx.adx()
 
-    # OBV
     obv = ta.volume.OnBalanceVolumeIndicator(df["Close"], df["Volume"])
     df["obv"] = obv.on_balance_volume()
 
-    # ATR
     atr = ta.volatility.AverageTrueRange(df["High"], df["Low"], df["Close"], window=14)
     df["atr"] = atr.average_true_range()
 
-    # MACD and histogram
     macd = ta.trend.MACD(
         close=df["Close"],
         window_slow=MACD_SLOW,
@@ -323,10 +312,6 @@ def resample_to_4h(df: pd.DataFrame) -> pd.DataFrame:
 # ----------------------------------------------------------------------
 
 def _download_batch_chunked(tickers, *, period, interval, label):
-    """
-    Download many tickers by splitting into chunks to avoid rate limits.
-    Returns dict[ticker] -> DataFrame (or None).
-    """
     if not tickers:
         return {}
 
@@ -427,15 +412,6 @@ def _extract_ema_trend(df_1h: pd.DataFrame) -> float:
         return np.nan
 
 def _compute_signal_for_df(df_daily: pd.DataFrame, ema_trend_value: float):
-    """
-    EMA(13/21) crossover with:
-      - EMA21 slope + ATR-z distance confirmation
-      - MACD histogram acceleration confirmation
-      - Optional OBV vote
-      - Optional ADX vote
-    Returns: ("BUY"/"SELL", close, adx, confidence) or None
-    """
-
     for col in df_daily.columns:
         if not is_numeric_dtype(df_daily[col]):
             try:
@@ -491,14 +467,12 @@ def _compute_signal_for_df(df_daily: pd.DataFrame, ema_trend_value: float):
 
     macd_accel_buy  = _macd_accel_ok(True)
     macd_accel_sell = _macd_accel_ok(False)
-
     adx_pass = (adx > ADX_MIN) if USE_ADX_CONFIRM else None
 
     def _slope_score(slope, min_thr, side):
         if side == "BUY":
             return float(np.clip((slope - min_thr) / max(2 * abs(min_thr), 1e-8), 0, 1))
-        else:
-            return float(np.clip((abs(slope) - abs(min_thr)) / max(2 * abs(min_thr), 1e-8), 0, 1))
+        return float(np.clip((abs(slope) - abs(min_thr)) / max(2 * abs(min_thr), 1e-8), 0, 1))
 
     def _z_score(z, lo, hi):
         mid = 0.5 * (lo + hi)
@@ -535,9 +509,7 @@ def _compute_signal_for_df(df_daily: pd.DataFrame, ema_trend_value: float):
         if USE_ADX_CONFIRM:
             votes.append(adx_pass)
 
-        confirm_score = sum(bool(v) for v in votes)
-
-        if confirm_score >= CONFIRM_SCORE_BUY:
+        if sum(bool(v) for v in votes) >= CONFIRM_SCORE_BUY:
             c_parts = [
                 _slope_score(slope_21, SLOPE_MIN_BUY, "BUY"),
                 _z_score(z_dist, Z_MIN_BUY, Z_MAX_BUY),
@@ -560,9 +532,7 @@ def _compute_signal_for_df(df_daily: pd.DataFrame, ema_trend_value: float):
         if USE_ADX_CONFIRM:
             votes.append(adx_pass)
 
-        confirm_score = sum(bool(v) for v in votes)
-
-        if confirm_score >= CONFIRM_SCORE_SELL:
+        if sum(bool(v) for v in votes) >= CONFIRM_SCORE_SELL:
             c_parts = [
                 _slope_score(slope_21, abs(SLOPE_MIN_SELL), "SELL"),
                 _z_score(z_dist, Z_MIN_SELL, Z_MAX_SELL),
@@ -647,9 +617,8 @@ def scan_tickers_batched(tickers, *, offset=0, batch_size=SCAN_BATCH_SIZE):
             continue
 
         side, close, adx, conf = sig
-
-        MIN_CONFIDENCE_ALERT = float(os.getenv("MIN_CONFIDENCE_ALERT", 0.40))
-        if conf < MIN_CONFIDENCE_ALERT:
+        min_conf = float(os.getenv("MIN_CONFIDENCE_ALERT", 0.40))
+        if conf < min_conf:
             logging.info(f"Skipping low-confidence {sym} signal ({conf:.2f})")
             continue
 
@@ -763,8 +732,7 @@ def _build_universe():
         + get_dow30_tickers()
         + get_sector_tickers()
     )
-    tickers = sorted(set(normalize_tickers(raw)))
-    return tickers
+    return sorted(set(normalize_tickers(raw)))
 
 # ----------------------------------------------------------------------
 # Flask (keep-alive + health)

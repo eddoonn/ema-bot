@@ -3,7 +3,8 @@
 # ============================================================
 # Scans S&P500 + NASDAQ100 + Dow30 + Biotech + Sector ETFs
 # Sends Discord alerts for confirmed EMA(13/21) crossovers
-# Uses 4H EMA200 trend filter + ADX/OBV/ATR/MACD confirmations
+# Uses TRUE 4H EMA200 trend filter via 1H -> 4H resampling
+# Uses ADX/OBV/ATR/MACD confirmations
 # Includes 5-day backtest performance summary
 # Batched downloads to reduce Yahoo rate limits
 # ============================================================
@@ -33,28 +34,29 @@ from pandas.api.types import is_numeric_dtype
 # Configuration (override via env vars on Render)
 # ----------------------------------------------------------------------
 
-DISCORD_WEBHOOK = os.getenv("DISCORD_WEBHOOK", "https://discord.com/api/webhooks/1484341490283970612/_5jXvSf-vMljRjqYM6jPe7gRXpesm0SEqG4d9OYh2ZN9nO-HXJe4n1gYpHPk6XtWMqyw")
+DISCORD_WEBHOOK = os.getenv("DISCORD_WEBHOOK")
+
 # run mode
 RUN_ONCE = os.getenv("RUN_ONCE", "0") == "1"  # if 1, exit after one full pass through universe
-
 
 EMA_FAST  = int(os.getenv("EMA_FAST", 13))
 EMA_SLOW  = int(os.getenv("EMA_SLOW", 21))
 EMA_TREND = int(os.getenv("EMA_TREND", 200))
 
-TIMEFRAME_DAILY = os.getenv("TIMEFRAME_DAILY", "1d")
-TIMEFRAME_4H    = os.getenv("TIMEFRAME_4H", "4h")
+TIMEFRAME_DAILY   = os.getenv("TIMEFRAME_DAILY", "1d")
+TIMEFRAME_4H_BASE = os.getenv("TIMEFRAME_4H_BASE", "1h")   # fetch hourly from Yahoo
+RESAMPLE_4H_RULE  = os.getenv("RESAMPLE_4H_RULE", "4h")    # build 4H candles locally
 
 CHECK_INTERVAL     = int(os.getenv("CHECK_INTERVAL", 120))       # sleep between loops
 HOLD_DAYS          = int(os.getenv("HOLD_DAYS", 5))
 CAPITAL_PER_TRADE  = float(os.getenv("CAPITAL_PER_TRADE", 500))
 LOG_FILE           = os.getenv("LOG_FILE", "trades_log.csv")
 
-# ---- Confirmation scoring tunables (legacy RSI vars remain defined but unused) ----
-RSI_MIN_BUY   = float(os.getenv("RSI_MIN_BUY", 50))    # (unused in current logic)
-RSI_MAX_SELL  = float(os.getenv("RSI_MAX_SELL", 50))   # (unused in current logic)
-ADX_MIN       = float(os.getenv("ADX_MIN", 15))        # still used (optional ADX vote)
-ATR_RATIO_MIN = float(os.getenv("ATR_RATIO_MIN", 0.7)) # (unused in current logic)
+# ---- Confirmation scoring tunables ----
+RSI_MIN_BUY   = float(os.getenv("RSI_MIN_BUY", 50))    # unused
+RSI_MAX_SELL  = float(os.getenv("RSI_MAX_SELL", 50))   # unused
+ADX_MIN       = float(os.getenv("ADX_MIN", 15))
+ATR_RATIO_MIN = float(os.getenv("ATR_RATIO_MIN", 0.7)) # unused
 
 # Allow a small buffer around the 4h EMA200 trend
 TREND_BUF     = float(os.getenv("TREND_BUF", 0.99))    # 0.99 ≈ allow ~1% below for buys
@@ -63,41 +65,41 @@ TREND_BUF     = float(os.getenv("TREND_BUF", 0.99))    # 0.99 ≈ allow ~1% belo
 CONFIRM_SCORE_BUY  = int(os.getenv("CONFIRM_SCORE_BUY", 2))
 CONFIRM_SCORE_SELL = int(os.getenv("CONFIRM_SCORE_SELL", 2))
 
-# Optional: count OBV as an extra vote (False by default)
+# Optional: count OBV as an extra vote
 USE_OBV = os.getenv("USE_OBV", "0") == "1"
 
-# ---- NEW: EMA(21) slope + ATR-z distance thresholds ----
-SLOPE_W          = int(os.getenv("SLOPE_W", 5))             # bars for EMA21 slope
-SLOPE_MIN_BUY    = float(os.getenv("SLOPE_MIN_BUY", 0.004)) # ≈ +0.3% over SLOPE_W bars
-SLOPE_MIN_SELL   = float(os.getenv("SLOPE_MIN_SELL", -0.004)) # ≈ -0.3% over SLOPE_W bars
+# ---- EMA(21) slope + ATR-z distance thresholds ----
+SLOPE_W          = int(os.getenv("SLOPE_W", 5))
+SLOPE_MIN_BUY    = float(os.getenv("SLOPE_MIN_BUY", 0.004))
+SLOPE_MIN_SELL   = float(os.getenv("SLOPE_MIN_SELL", -0.004))
 
-Z_MIN_BUY        = float(os.getenv("Z_MIN_BUY", -0.4))      # (Close-EMA21)/ATR lower bound (long)
-Z_MAX_BUY        = float(os.getenv("Z_MAX_BUY",  0.4))      # upper bound (avoid chases)
-Z_MIN_SELL       = float(os.getenv("Z_MIN_SELL", -0.4))     # short-side band
+Z_MIN_BUY        = float(os.getenv("Z_MIN_BUY", -0.4))
+Z_MAX_BUY        = float(os.getenv("Z_MAX_BUY",  0.4))
+Z_MIN_SELL       = float(os.getenv("Z_MIN_SELL", -0.4))
 Z_MAX_SELL       = float(os.getenv("Z_MAX_SELL",  0.4))
 
-# ---- NEW: MACD histogram acceleration ----
+# ---- MACD histogram acceleration ----
 MACD_FAST        = int(os.getenv("MACD_FAST", 12))
 MACD_SLOW        = int(os.getenv("MACD_SLOW", 26))
 MACD_SIGNAL      = int(os.getenv("MACD_SIGNAL", 9))
-MACD_ACCEL_BARS  = int(os.getenv("MACD_ACCEL_BARS", 2))   # require rising/falling last N bars
+MACD_ACCEL_BARS  = int(os.getenv("MACD_ACCEL_BARS", 2))
 
-# ---- NEW: Optional ADX as an additional vote ----
+# ---- Optional ADX as an additional vote ----
 USE_ADX_CONFIRM  = os.getenv("USE_ADX_CONFIRM", "1") == "1"
 
 # scanning cadence
-SCAN_BATCH_SIZE    = int(os.getenv("SCAN_BATCH_SIZE", 150))       # tickers per rotating batch
-BATCHES_PER_LOOP   = int(os.getenv("BATCHES_PER_LOOP", 1))        # how many batches per loop
-BATCH_PAUSE        = float(os.getenv("BATCH_PAUSE", 3.0))         # seconds pause between batches in a loop
+SCAN_BATCH_SIZE    = int(os.getenv("SCAN_BATCH_SIZE", 150))
+BATCHES_PER_LOOP   = int(os.getenv("BATCHES_PER_LOOP", 1))
+BATCH_PAUSE        = float(os.getenv("BATCH_PAUSE", 3.0))
 
 # rate-limit / resiliency
 MAX_RETRIES        = int(os.getenv("MAX_RETRIES", 3))
 BACKOFF_BASE       = float(os.getenv("BACKOFF_BASE", 1.7))
 BACKOFF_JITTER_MAX = float(os.getenv("BACKOFF_JITTER_MAX", 0.35))
-RATE_LIMIT_DELAY   = float(os.getenv("RATE_LIMIT_DELAY", 0.0))    # small pause after each chunk request
+RATE_LIMIT_DELAY   = float(os.getenv("RATE_LIMIT_DELAY", 0.0))
 
 # yfinance chunking inside a batch
-YF_BATCH_CHUNK     = int(os.getenv("YF_BATCH_CHUNK", 50))         # 40–60 recommended
+YF_BATCH_CHUNK     = int(os.getenv("YF_BATCH_CHUNK", 50))
 
 # logging
 logging.basicConfig(
@@ -107,7 +109,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# quiet yfinance’s own "Failed download" lines
+# quiet yfinance's own "Failed download" lines
 logging.getLogger("yfinance").setLevel(logging.ERROR)
 
 # ----------------------------------------------------------------------
@@ -128,7 +130,7 @@ LAST_SCAN_SUMMARY = {
 # ----------------------------------------------------------------------
 
 def send_discord_message(content: str):
-    if (not DISCORD_WEBHOOK) or ("REPLACE_WITH_YOUR_WEBHOOK" in DISCORD_WEBHOOK):
+    if not DISCORD_WEBHOOK:
         logging.warning("⚠️ No valid webhook URL configured — alert not sent.")
         return
     try:
@@ -156,7 +158,7 @@ def _normalize_ticker(x):
         return None
     s = s.split()[0]
     s = s.replace(".", "-")  # BRK.B -> BRK-B for Yahoo
-    if not re.fullmatch(r"[A-Z\-]+", s):
+    if not re.fullmatch(r"[A-Z0-9\-]+", s):
         return None
     if len(s) > 12:
         return None
@@ -250,21 +252,20 @@ def get_sector_tickers():
 
 def fetch_indicators(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
-    # Removed RSI: no longer used in logic
 
     # ADX
     adx = ta.trend.ADXIndicator(df["High"], df["Low"], df["Close"], window=14)
     df["adx"] = adx.adx()
 
-    # OBV (optional vote)
+    # OBV
     obv = ta.volume.OnBalanceVolumeIndicator(df["Close"], df["Volume"])
     df["obv"] = obv.on_balance_volume()
 
-    # ATR (for z-distance and risk/confidence)
+    # ATR
     atr = ta.volatility.AverageTrueRange(df["High"], df["Low"], df["Close"], window=14)
     df["atr"] = atr.average_true_range()
 
-    # NEW: MACD and histogram (acceleration)
+    # MACD and histogram
     macd = ta.trend.MACD(
         close=df["Close"],
         window_slow=MACD_SLOW,
@@ -282,6 +283,40 @@ def _to_numeric_cols(df: pd.DataFrame, cols):
         if c in df.columns:
             df[c] = pd.to_numeric(df[c], errors="coerce")
     return df
+
+# ----------------------------------------------------------------------
+# 1H -> TRUE 4H resampling
+# ----------------------------------------------------------------------
+
+def resample_to_4h(df: pd.DataFrame) -> pd.DataFrame:
+    if df is None or df.empty:
+        return None
+
+    out = df.copy()
+
+    if not isinstance(out.index, pd.DatetimeIndex):
+        out.index = pd.to_datetime(out.index, errors="coerce")
+
+    out = out[~out.index.isna()].sort_index()
+
+    needed = ["Open", "High", "Low", "Close", "Volume"]
+    out = _to_numeric_cols(out, needed)
+
+    agg = {
+        "Open": "first",
+        "High": "max",
+        "Low": "min",
+        "Close": "last",
+        "Volume": "sum",
+    }
+
+    out = out.resample(RESAMPLE_4H_RULE).agg(agg)
+    out = out.dropna(subset=["Open", "High", "Low", "Close"])
+
+    if out.empty:
+        return None
+
+    return out
 
 # ----------------------------------------------------------------------
 # Batch downloads (CHUNKED) to reduce rate limits
@@ -309,8 +344,9 @@ def _download_batch_chunked(tickers, *, period, interval, label):
                     progress=False,
                     auto_adjust=False,
                     threads=False,
-                    group_by='ticker'
+                    group_by="ticker"
                 )
+
                 if isinstance(df, pd.DataFrame) and not df.empty:
                     if isinstance(df.columns, pd.MultiIndex):
                         for t in chunk:
@@ -320,15 +356,15 @@ def _download_batch_chunked(tickers, *, period, interval, label):
                             else:
                                 merged[t] = None
                     else:
-                        # Rare case: single wide frame — assign to first symbol
                         merged[chunk[0]] = df
+                        for t in chunk[1:]:
+                            merged[t] = None
                 else:
-                    # empty — likely rate-limited
-                    raise RuntimeError("Empty DataFrame (possibly rate-limited)")
+                    raise RuntimeError("Empty DataFrame (possibly rate-limited or unsupported interval)")
 
                 if RATE_LIMIT_DELAY > 0:
                     time.sleep(RATE_LIMIT_DELAY)
-                break  # chunk done
+                break
 
             except Exception as e:
                 last_exc = e
@@ -341,7 +377,6 @@ def _download_batch_chunked(tickers, *, period, interval, label):
                     logging.warning(f"{label} chunk {ci}/{len(chunks)}: transient error, backoff attempt {attempt+1}/{MAX_RETRIES}")
                     _sleep_backoff(attempt)
                     continue
-                # non-transient — give up this chunk
                 break
 
         if chunk and (chunk[0] not in merged):
@@ -363,21 +398,29 @@ def _download_single_symbol(sym: str, *, period, interval, label):
 def _prepare_daily_df(df_daily: pd.DataFrame) -> pd.DataFrame:
     if df_daily is None or df_daily.empty:
         return None
+
     cols = ["Open", "High", "Low", "Close", "Volume"]
     df_daily = _to_numeric_cols(df_daily.copy(), cols)
+
     try:
         df_daily = fetch_indicators(df_daily)
         df_daily["ema_fast"] = df_daily["Close"].ewm(span=EMA_FAST, adjust=False).mean()
         df_daily["ema_slow"] = df_daily["Close"].ewm(span=EMA_SLOW, adjust=False).mean()
     except Exception:
         return None
+
     return df_daily
 
-def _extract_ema_trend(df_4h: pd.DataFrame) -> float:
-    if df_4h is None or df_4h.empty:
+def _extract_ema_trend(df_1h: pd.DataFrame) -> float:
+    if df_1h is None or df_1h.empty:
         return np.nan
+
     try:
-        df_4h = _to_numeric_cols(df_4h.copy(), ["Close"])
+        df_1h = _to_numeric_cols(df_1h.copy(), ["Open", "High", "Low", "Close", "Volume"])
+        df_4h = resample_to_4h(df_1h)
+        if df_4h is None or df_4h.empty:
+            return np.nan
+
         df_4h["ema_trend"] = df_4h["Close"].ewm(span=EMA_TREND, adjust=False).mean()
         return to_float(df_4h["ema_trend"].iloc[-1])
     except Exception:
@@ -386,14 +429,13 @@ def _extract_ema_trend(df_4h: pd.DataFrame) -> float:
 def _compute_signal_for_df(df_daily: pd.DataFrame, ema_trend_value: float):
     """
     EMA(13/21) crossover with:
-      - Slope+Distance confirmation (EMA21 slope over SLOPE_W bars + ATR-z distance band)
+      - EMA21 slope + ATR-z distance confirmation
       - MACD histogram acceleration confirmation
-      - Optional OBV vote (if USE_OBV=1)
-      - Optional ADX vote (if USE_ADX_CONFIRM=1)
+      - Optional OBV vote
+      - Optional ADX vote
     Returns: ("BUY"/"SELL", close, adx, confidence) or None
     """
 
-    # Ensure numeric
     for col in df_daily.columns:
         if not is_numeric_dtype(df_daily[col]):
             try:
@@ -404,7 +446,6 @@ def _compute_signal_for_df(df_daily: pd.DataFrame, ema_trend_value: float):
     if len(df_daily) < max(EMA_SLOW, 50) or pd.isna(ema_trend_value):
         return None
 
-    # --- Latest values ---
     prev_fast = to_float(df_daily["ema_fast"].iloc[-2])
     prev_slow = to_float(df_daily["ema_slow"].iloc[-2])
     ema_fast  = to_float(df_daily["ema_fast"].iloc[-1])
@@ -412,7 +453,6 @@ def _compute_signal_for_df(df_daily: pd.DataFrame, ema_trend_value: float):
     close     = to_float(df_daily["Close"].iloc[-1])
     adx       = to_float(df_daily["adx"].iloc[-1])
     atr       = to_float(df_daily["atr"].iloc[-1])
-    # rolling(100) may be NaN on short histories; handle safely in normalization
     atr_mean  = to_float(df_daily["atr"].rolling(100).mean().iloc[-1])
     macd_hist = df_daily["macd_hist"].values
 
@@ -422,24 +462,20 @@ def _compute_signal_for_df(df_daily: pd.DataFrame, ema_trend_value: float):
     if len(macd_hist) < (MACD_ACCEL_BARS + 2) or len(df_daily) <= SLOPE_W:
         return None
 
-    # --- Trend (regime) gates vs "trend EMA" ---
     is_above_trend = (close > ema_trend_value * TREND_BUF)
     is_below_trend = (close < ema_trend_value / TREND_BUF)
 
-    # --- Cross directions ---
     crossed_up   = (prev_fast <= prev_slow) and (ema_fast > ema_slow)
     crossed_down = (prev_fast >= prev_slow) and (ema_fast < ema_slow)
 
-    # --- Slope+Distance (EMA21 slope over SLOPE_W bars + ATR-z) ---
     ema_slow_t   = float(df_daily["ema_slow"].iloc[-1])
     ema_slow_tmW = float(df_daily["ema_slow"].iloc[-SLOPE_W])
     slope_21     = (ema_slow_t / ema_slow_tmW - 1.0) if ema_slow_tmW else 0.0
     z_dist       = (close - ema_slow_t) / max(atr, 1e-8)
 
-    slope_dist_buy  = (slope_21 >  SLOPE_MIN_BUY)  and (Z_MIN_BUY  <= z_dist <= Z_MAX_BUY)
-    slope_dist_sell = (slope_21 <  SLOPE_MIN_SELL) and (Z_MIN_SELL <= z_dist <= Z_MAX_SELL)
+    slope_dist_buy  = (slope_21 > SLOPE_MIN_BUY) and (Z_MIN_BUY <= z_dist <= Z_MAX_BUY)
+    slope_dist_sell = (slope_21 < SLOPE_MIN_SELL) and (Z_MIN_SELL <= z_dist <= Z_MAX_SELL)
 
-    # --- MACD histogram acceleration ---
     def _macd_accel_ok(long_side: bool):
         n = MACD_ACCEL_BARS
         for i in range(1, n + 1):
@@ -456,16 +492,13 @@ def _compute_signal_for_df(df_daily: pd.DataFrame, ema_trend_value: float):
     macd_accel_buy  = _macd_accel_ok(True)
     macd_accel_sell = _macd_accel_ok(False)
 
-    # --- Optional ADX vote ---
     adx_pass = (adx > ADX_MIN) if USE_ADX_CONFIRM else None
 
-    # --- Confidence scoring helpers ---
     def _slope_score(slope, min_thr, side):
         if side == "BUY":
-            return float(np.clip((slope - min_thr) / max(2*abs(min_thr), 1e-8), 0, 1))
+            return float(np.clip((slope - min_thr) / max(2 * abs(min_thr), 1e-8), 0, 1))
         else:
-            # more negative is better
-            return float(np.clip((abs(slope) - abs(min_thr)) / max(2*abs(min_thr), 1e-8), 0, 1))
+            return float(np.clip((abs(slope) - abs(min_thr)) / max(2 * abs(min_thr), 1e-8), 0, 1))
 
     def _z_score(z, lo, hi):
         mid = 0.5 * (lo + hi)
@@ -478,10 +511,10 @@ def _compute_signal_for_df(df_daily: pd.DataFrame, ema_trend_value: float):
         n = MACD_ACCEL_BARS
         deltas = []
         for i in range(1, n + 1):
-            h0 = float(macd_hist[-i]); h1 = float(macd_hist[-i-1])
+            h0 = float(macd_hist[-i])
+            h1 = float(macd_hist[-i - 1])
             d = h0 - h1
             deltas.append(max(d, 0) if long_side else max(-d, 0))
-        # Safe normalization independent of ATR scale; fallback if atr_mean is NaN/0
         denom_base = atr_mean if (atr_mean is not None and np.isfinite(atr_mean) and atr_mean > 0) else 1.0
         denom = 0.5 * denom_base
         base = max(float(np.mean(deltas)), 0.0)
@@ -490,7 +523,6 @@ def _compute_signal_for_df(df_daily: pd.DataFrame, ema_trend_value: float):
     def _adx_score(a):
         return float(np.clip((a - ADX_MIN) / 25.0, 0, 1))
 
-    # -------------- BUY logic --------------
     if crossed_up and is_above_trend:
         votes = [slope_dist_buy, macd_accel_buy]
         if USE_OBV:
@@ -516,7 +548,6 @@ def _compute_signal_for_df(df_daily: pd.DataFrame, ema_trend_value: float):
             confidence = round(float(np.nanmean(c_parts)), 2)
             return ("BUY", close, adx, confidence)
 
-    # -------------- SELL logic --------------
     if crossed_down and is_below_trend:
         votes = [slope_dist_sell, macd_accel_sell]
         if USE_OBV:
@@ -549,7 +580,6 @@ def _compute_signal_for_df(df_daily: pd.DataFrame, ema_trend_value: float):
 # ----------------------------------------------------------------------
 
 def scan_tickers_batched(tickers, *, offset=0, batch_size=SCAN_BATCH_SIZE):
-    """Scan a rotating batch using chunked multi-ticker downloads."""
     conf_signals = []
 
     n = len(tickers)
@@ -579,12 +609,12 @@ def scan_tickers_batched(tickers, *, offset=0, batch_size=SCAN_BATCH_SIZE):
         f"(~{(next_offset / n) * 100.0:.1f}% of universe covered)"
     )
 
-    # --- Download price data in chunks ---
     try:
         daily_map = _download_batch_chunked(batch, period="120d", interval=TIMEFRAME_DAILY, label="daily")
         if RATE_LIMIT_DELAY > 0:
             time.sleep(RATE_LIMIT_DELAY)
-        h4_map = _download_batch_chunked(batch, period="60d", interval=TIMEFRAME_4H, label="4h")
+
+        h1_map = _download_batch_chunked(batch, period="60d", interval=TIMEFRAME_4H_BASE, label="1h-base-for-4h")
         if RATE_LIMIT_DELAY > 0:
             time.sleep(RATE_LIMIT_DELAY)
     except Exception as e:
@@ -592,25 +622,23 @@ def scan_tickers_batched(tickers, *, offset=0, batch_size=SCAN_BATCH_SIZE):
         logging.warning(f"Batch download failed: {e}")
         return conf_signals, next_offset
 
-    # --- Evaluate each symbol in the batch ---
     for sym in batch:
         df_daily = daily_map.get(sym)
-        df_4h = h4_map.get(sym)
+        df_1h = h1_map.get(sym)
 
-        # Fallback single-symbol downloads if missing
         if (df_daily is None) or df_daily.empty:
             df_daily = _download_single_symbol(sym, period="120d", interval=TIMEFRAME_DAILY, label=f"daily:{sym}")
-        if (df_4h is None) or df_4h.empty:
-            df_4h = _download_single_symbol(sym, period="60d", interval=TIMEFRAME_4H, label=f"4h:{sym}")
+        if (df_1h is None) or df_1h.empty:
+            df_1h = _download_single_symbol(sym, period="60d", interval=TIMEFRAME_4H_BASE, label=f"1h-base-for-4h:{sym}")
 
-        if df_daily is None or df_daily.empty or df_4h is None or df_4h.empty:
+        if df_daily is None or df_daily.empty or df_1h is None or df_1h.empty:
             continue
 
         df_daily = _prepare_daily_df(df_daily)
         if df_daily is None or len(df_daily) < max(EMA_SLOW, 50):
             continue
 
-        ema_trend_value = _extract_ema_trend(df_4h)
+        ema_trend_value = _extract_ema_trend(df_1h)
         if pd.isna(ema_trend_value):
             continue
 
@@ -618,12 +646,9 @@ def scan_tickers_batched(tickers, *, offset=0, batch_size=SCAN_BATCH_SIZE):
         if sig is None:
             continue
 
-        # --- Unpack the new return structure ---
         side, close, adx, conf = sig
 
-        # --- Format and filter message by confidence threshold ---
-        MIN_CONFIDENCE_ALERT = float(os.getenv("MIN_CONFIDENCE_ALERT", 0.40))  # adjustable via env var
-
+        MIN_CONFIDENCE_ALERT = float(os.getenv("MIN_CONFIDENCE_ALERT", 0.40))
         if conf < MIN_CONFIDENCE_ALERT:
             logging.info(f"Skipping low-confidence {sym} signal ({conf:.2f})")
             continue
@@ -672,7 +697,7 @@ def evaluate_old_signals():
         return None
 
     try:
-        df["date"]  = pd.to_datetime(df["date"], errors="coerce")
+        df["date"] = pd.to_datetime(df["date"], errors="coerce")
         df["price"] = pd.to_numeric(df["price"], errors="coerce")
     except Exception:
         pass
@@ -683,20 +708,25 @@ def evaluate_old_signals():
         return None
 
     results = []
-    for _, row in eligible.iterrows():
+    used_idx = []
+
+    for idx, row in eligible.iterrows():
         sym  = str(row["symbol"])
         side = str(row["signal"])
         entry = to_float(row["price"])
+
         try:
             df_hist = _download_single_symbol_for_backtest(sym)
             if df_hist is None or len(df_hist) < HOLD_DAYS:
                 continue
-            exit_price = float(df_hist["Close"].iloc[HOLD_DAYS - 1])
+
+            exit_price = float(df_hist["Close"].iloc[min(HOLD_DAYS - 1, len(df_hist) - 1)])
             ret = (exit_price - entry) / entry if entry else 0.0
             if side.upper() == "SELL":
                 ret = -ret
             profit = ret * CAPITAL_PER_TRADE
             results.append((sym, side, float(entry), float(exit_price), float(profit)))
+            used_idx.append(idx)
         except Exception as e:
             logging.error(f"Backtest {sym}: {e}")
 
@@ -713,7 +743,7 @@ def evaluate_old_signals():
         msg += f"{emoji} {sym} {side} {entry:.2f} → {exitp:.2f} | {prof:+.2f} USD\n"
     msg += f"\n**Total:** {total:+.2f} USD | **Winrate:** {winrate:.1f}% | **Avg:** {avg_trade:+.2f} USD/trade"
 
-    df_remaining = df[~df["symbol"].isin([r[0] for r in results])]
+    df_remaining = df.drop(index=used_idx)
     try:
         df_remaining.to_csv(LOG_FILE, index=False)
     except Exception as e:
@@ -742,11 +772,11 @@ def _build_universe():
 
 app = Flask(__name__)
 
-@app.route('/')
+@app.route("/")
 def home():
     return "EMA Scanner running."
 
-@app.route('/healthz')
+@app.route("/healthz")
 def healthz():
     return jsonify(LAST_SCAN_SUMMARY)
 
@@ -763,6 +793,9 @@ def main():
         tickers = _build_universe()
         logging.info(f"Total tickers to scan: {len(tickers)}")
         logging.info("🚀 EMA Multi-Factor Scanner Started")
+        logging.info(f"Daily interval: {TIMEFRAME_DAILY}")
+        logging.info(f"4H base download interval: {TIMEFRAME_4H_BASE}")
+        logging.info(f"4H resample rule: {RESAMPLE_4H_RULE}")
         send_discord_message("🟢 Bot online and scanning…")
     except Exception as e:
         logging.error(f"Failed to build ticker universe: {e}")
@@ -772,7 +805,8 @@ def main():
     LAST_SCAN_SUMMARY["universe_size"] = len(tickers)
 
     offset = 0
-    prev_offset = 0  # NEW: to detect wrap-around (full coverage)
+    prev_offset = 0
+
     while True:
         try:
             total_signals = 0
@@ -803,10 +837,8 @@ def main():
             LAST_SCAN_SUMMARY["last_error"] = f"{type(e).__name__}: {e}"
             logging.error(f"⚠️ Global loop error: {type(e).__name__} — {e}")
             traceback.print_exc()
-            
-        # --- NEW: exit after one full pass if requested ---
+
         if RUN_ONCE:
-            # When offset wraps (becomes smaller than previous), we've covered the full universe once
             if offset < prev_offset:
                 logging.info("✅ Completed one full pass through the universe (RUN_ONCE=1). Exiting.")
                 break
@@ -825,4 +857,3 @@ if __name__ == "__main__":
     except Exception as e:
         logging.error(f"Fatal error: {e}")
         traceback.print_exc()
-

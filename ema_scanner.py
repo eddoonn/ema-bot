@@ -156,13 +156,21 @@ def _normalize_ticker(x):
         return None
     return s
 
-def normalize_tickers(seq):
-    out = []
-    for x in seq:
-        s = _normalize_ticker(x)
-        if s:
-            out.append(s)
-    return out
+def _normalize_ticker(x):
+    if x is None:
+        return None
+    s = str(x).strip().upper()
+    if not s:
+        return None
+    s = s.split()[0]
+    s = s.replace(".", "-")
+    if not re.fullmatch(r"[A-Z0-9\-]+", s):
+        return None
+    if not re.search(r"[A-Z]", s):
+        return None
+    if len(s) > 12:
+        return None
+    return s
 
 def safe_read_html(url):
     headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
@@ -193,10 +201,21 @@ def get_sp500_tickers():
 def get_biotech_tickers():
     try:
         tables = safe_read_html("https://en.wikipedia.org/wiki/List_of_biotechnology_companies")
-        bio = tables[0]
-        tickers = bio.iloc[:, 0].dropna().astype(str).tolist()[:100]
-        logging.info(f"Loaded {len(tickers)} biotech tickers from Wikipedia.")
-        return tickers
+
+        for t in tables:
+            cols = [str(c).strip().lower() for c in t.columns]
+
+            for wanted in ["ticker", "symbol", "nyse", "nasdaq"]:
+                matches = [i for i, c in enumerate(cols) if wanted in c]
+                if matches:
+                    idx = matches[0]
+                    tickers = t.iloc[:, idx].dropna().astype(str).tolist()
+                    tickers = normalize_tickers(tickers)
+                    logging.info(f"Loaded {len(tickers)} biotech tickers from Wikipedia.")
+                    return tickers[:100]
+
+        raise ValueError("No ticker-like column found in biotech table.")
+
     except Exception as e:
         logging.error(f"Biotech list error: {e}")
         return ["BIIB","REGN","VRTX","GILD","ALNY","ILMN"]
@@ -320,6 +339,7 @@ def _download_batch_chunked(tickers, *, period, interval, label):
 
     for ci, chunk in enumerate(chunks, 1):
         last_exc = None
+
         for attempt in range(MAX_RETRIES):
             try:
                 df = yf.download(
@@ -341,6 +361,7 @@ def _download_batch_chunked(tickers, *, period, interval, label):
                             else:
                                 merged[t] = None
                     else:
+                        # Single-symbol response
                         merged[chunk[0]] = df
                         for t in chunk[1:]:
                             merged[t] = None
@@ -349,26 +370,47 @@ def _download_batch_chunked(tickers, *, period, interval, label):
 
                 if RATE_LIMIT_DELAY > 0:
                     time.sleep(RATE_LIMIT_DELAY)
+
                 break
 
             except Exception as e:
                 last_exc = e
                 msg = str(e)
+                msg_l = msg.lower()
+
                 if any(s in msg for s in ["Rate limited", "Too Many Requests", "429", "rate-limit"]):
-                    logging.warning(f"{label} chunk {ci}/{len(chunks)}: rate-limited, backoff attempt {attempt+1}/{MAX_RETRIES}")
+                    logging.warning(
+                        f"{label} chunk {ci}/{len(chunks)}: rate-limited, backoff attempt {attempt+1}/{MAX_RETRIES}"
+                    )
                     _sleep_backoff(attempt)
                     continue
-                if any(s in msg.lower() for s in ["timed out", "timeout", "temporary failure", "connection reset"]):
-                    logging.warning(f"{label} chunk {ci}/{len(chunks)}: transient error, backoff attempt {attempt+1}/{MAX_RETRIES}")
+
+                if any(s in msg_l for s in [
+                    "timed out",
+                    "timeout",
+                    "temporary failure",
+                    "connection reset",
+                    "nonetype",
+                    "not subscriptable",
+                    "failed download",
+                    "jsondecodeerror",
+                    "expecting value",
+                    "remote end closed connection",
+                ]):
+                    logging.warning(
+                        f"{label} chunk {ci}/{len(chunks)}: transient error, backoff attempt {attempt+1}/{MAX_RETRIES}"
+                    )
                     _sleep_backoff(attempt)
                     continue
+
+                logging.warning(f"{label} chunk {ci}/{len(chunks)} non-retryable error: {e}")
                 break
 
-        if chunk and (chunk[0] not in merged):
-            if last_exc:
-                logging.warning(f"{label} chunk {ci}/{len(chunks)} failed: {last_exc}")
-            for t in chunk:
-                merged.setdefault(t, None)
+        for t in chunk:
+            merged.setdefault(t, None)
+
+        if last_exc and all(merged.get(t) is None for t in chunk):
+            logging.warning(f"{label} chunk {ci}/{len(chunks)} failed: {last_exc}")
 
     return merged
 

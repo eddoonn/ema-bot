@@ -17,7 +17,7 @@ import random
 import logging
 import datetime
 import traceback
-from io import StringIO
+import urllib.request
 from threading import Thread
 
 import numpy as np
@@ -43,7 +43,7 @@ EMA_SLOW  = int(os.getenv("EMA_SLOW", 21))
 EMA_TREND = int(os.getenv("EMA_TREND", 200))
 
 TIMEFRAME_DAILY = os.getenv("TIMEFRAME_DAILY", "1d")
-TIMEFRAME_4H    = os.getenv("TIMEFRAME_4H", "4h")
+TIMEFRAME_4H    = os.getenv("TIMEFRAME_4H", "1h")
 
 CHECK_INTERVAL     = int(os.getenv("CHECK_INTERVAL", 120))       # sleep between loops
 HOLD_DAYS          = int(os.getenv("HOLD_DAYS", 5))
@@ -171,10 +171,11 @@ def normalize_tickers(seq):
     return out
 
 def safe_read_html(url):
-    headers = {"User-Agent": "Mozilla/5.0"}
-    resp = requests.get(url, headers=headers, timeout=20)
-    resp.raise_for_status()
-    return pd.read_html(StringIO(resp.text))
+    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
+    req = urllib.request.Request(url, headers=headers)
+    with urllib.request.urlopen(req, timeout=20) as resp:
+        html = resp.read()
+    return pd.read_html(html)
 
 def _sleep_backoff(attempt: int):
     wait = (BACKOFF_BASE ** attempt) + random.random() * BACKOFF_JITTER_MAX
@@ -583,7 +584,7 @@ def scan_tickers_batched(tickers, *, offset=0, batch_size=SCAN_BATCH_SIZE):
         daily_map = _download_batch_chunked(batch, period="120d", interval=TIMEFRAME_DAILY, label="daily")
         if RATE_LIMIT_DELAY > 0:
             time.sleep(RATE_LIMIT_DELAY)
-        h4_map = _download_batch_chunked(batch, period="180d", interval=TIMEFRAME_4H, label="4h")
+        h4_map = _download_batch_chunked(batch, period="60d", interval=TIMEFRAME_4H, label="4h")
         if RATE_LIMIT_DELAY > 0:
             time.sleep(RATE_LIMIT_DELAY)
     except Exception as e:
@@ -600,7 +601,7 @@ def scan_tickers_batched(tickers, *, offset=0, batch_size=SCAN_BATCH_SIZE):
         if (df_daily is None) or df_daily.empty:
             df_daily = _download_single_symbol(sym, period="120d", interval=TIMEFRAME_DAILY, label=f"daily:{sym}")
         if (df_4h is None) or df_4h.empty:
-            df_4h = _download_single_symbol(sym, period="180d", interval=TIMEFRAME_4H, label=f"4h:{sym}")
+            df_4h = _download_single_symbol(sym, period="60d", interval=TIMEFRAME_4H, label=f"4h:{sym}")
 
         if df_daily is None or df_daily.empty or df_4h is None or df_4h.empty:
             continue

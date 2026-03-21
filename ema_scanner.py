@@ -25,7 +25,7 @@ import yfinance as yf
 import requests
 import ta
 
-from flask import Flask, jsonify
+from flask import Flask, jsonify, request
 from pandas.api.types import is_numeric_dtype
 
 # ----------------------------------------------------------------------
@@ -144,6 +144,9 @@ SECTOR_PROXY_BY_SYMBOL = {}
 BIOTECH_SYMBOLS = set()
 EARNINGS_CACHE = {}
 OPENINSIDER_CACHE = {}
+
+RUN_TOKEN = os.getenv("RUN_TOKEN", "")
+MANUAL_SCAN_RUNNING = False
 
 GICS_TO_ETF = {
     "Communication Services": "XLC",
@@ -1471,6 +1474,61 @@ def _build_universe():
         + extra
     )
     return sorted(set(normalize_tickers(raw)))
+
+def run_one_full_pass():
+    global MANUAL_SCAN_RUNNING
+
+    if MANUAL_SCAN_RUNNING:
+        logging.info("Manual scan already running. Skipping new request.")
+        return
+
+    MANUAL_SCAN_RUNNING = True
+    try:
+        tickers = _build_universe()
+        random.shuffle(tickers)
+
+        logging.info(f"Manual run: total tickers to scan: {len(tickers)}")
+
+        offset = 0
+        prev_offset = 0
+
+        while True:
+            total_signals = 0
+            batches = max(1, BATCHES_PER_LOOP)
+
+            for i in range(batches):
+                conf_signals, offset = scan_tickers_batched(
+                    tickers, offset=offset, batch_size=SCAN_BATCH_SIZE
+                )
+                total_signals += len(conf_signals)
+
+                if conf_signals:
+                    now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M")
+                    msg = f"**EMA Precision Alerts ({now})**\n" + "\n".join(conf_signals)
+                    send_discord_message(msg)
+
+                if i < batches - 1 and BATCH_PAUSE > 0:
+                    time.sleep(BATCH_PAUSE)
+
+            if total_signals == 0:
+                logging.info("Manual run: no signals in this pass segment")
+
+            report = evaluate_old_signals()
+            if report:
+                send_discord_message(report)
+
+            if offset < prev_offset:
+                logging.info("Manual run: completed one full pass through the universe.")
+                break
+
+            prev_offset = offset
+
+    except Exception as e:
+        logging.error(f"Manual run failed: {type(e).__name__} - {e}")
+        traceback.print_exc()
+    finally:
+        MANUAL_SCAN_RUNNING = False
+
 # ----------------------------------------------------------------------
 # Flask
 # ----------------------------------------------------------------------
@@ -1488,6 +1546,19 @@ def healthz():
 def run_flask():
     port = int(os.environ.get("PORT", 10000))
     app.run(host="0.0.0.0", port=port)
+
+@app.route("/run-once", methods=["POST", "GET"])
+def run_once_endpoint():
+    token = request.args.get("token") or request.headers.get("X-Run-Token")
+
+    if not RUN_TOKEN or token != RUN_TOKEN:
+        return jsonify({"ok": False, "error": "unauthorized"}), 403
+
+    if MANUAL_SCAN_RUNNING:
+        return jsonify({"ok": True, "status": "already running"}), 202
+
+    Thread(target=run_one_full_pass, daemon=True).start()
+    return jsonify({"ok": True, "status": "started"}), 202
 
 # ----------------------------------------------------------------------
 # Main

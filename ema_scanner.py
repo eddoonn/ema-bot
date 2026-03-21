@@ -332,6 +332,7 @@ def get_biotech_tickers():
     try:
         tables = safe_read_html("https://en.wikipedia.org/wiki/List_of_biotechnology_companies")
 
+        # First try the old behavior: look for an explicit ticker/symbol column
         for t in tables:
             cols = [str(c).strip().lower() for c in t.columns]
             for wanted in ["ticker", "symbol", "nyse", "nasdaq"]:
@@ -340,12 +341,43 @@ def get_biotech_tickers():
                     idx = matches[0]
                     tickers = t.iloc[:, idx].dropna().astype(str).tolist()
                     tickers = normalize_tickers(tickers)
-                    BIOTECH_SYMBOLS.update(tickers[:100])
-                    for sym in tickers[:100]:
-                        SECTOR_PROXY_BY_SYMBOL.setdefault(sym, "XBI")
-                    logging.info(f"Loaded {len(tickers)} biotech tickers from Wikipedia.")
-                    return tickers[:100]
-        raise ValueError("No ticker-like column found in biotech table.")
+                    if tickers:
+                        BIOTECH_SYMBOLS.update(tickers[:100])
+                        for sym in tickers[:100]:
+                            SECTOR_PROXY_BY_SYMBOL.setdefault(sym, "XBI")
+                        logging.info(f"Loaded {len(tickers)} biotech tickers from Wikipedia.")
+                        return tickers[:100]
+
+        # Fallback for the current redirected Wikipedia page:
+        # ticker is embedded in the "Traded on" column, e.g. "NYSE: JNJ"
+        extracted = []
+        for t in tables:
+            cols = [str(c).strip() for c in t.columns]
+            traded_cols = [c for c in cols if "Traded on" in c or "Listed on" in c or "Exchange" in c]
+            if not traded_cols:
+                continue
+
+            col = traded_cols[0]
+            for val in t[col].dropna().astype(str):
+                m = re.search(r":\s*([A-Z][A-Z0-9\.\-]{0,10})\b", val)
+                if m:
+                    extracted.append(m.group(1))
+
+        tickers = normalize_tickers(extracted)
+
+        # Keep only US-style tradable symbols for this scanner
+        tickers = [t for t in tickers if re.fullmatch(r"[A-Z][A-Z0-9\-]{0,10}", t)]
+
+        if tickers:
+            tickers = list(dict.fromkeys(tickers))  # dedupe, preserve order
+            BIOTECH_SYMBOLS.update(tickers[:100])
+            for sym in tickers[:100]:
+                SECTOR_PROXY_BY_SYMBOL.setdefault(sym, "XBI")
+            logging.info(f"Loaded {len(tickers)} biotech tickers from redirected Wikipedia page.")
+            return tickers[:100]
+
+        raise ValueError("No ticker-like data found in biotech table.")
+
     except Exception as e:
         logging.error(f"Biotech list error: {e}")
         fallback = ["BIIB", "REGN", "VRTX", "GILD", "ALNY", "ILMN"]

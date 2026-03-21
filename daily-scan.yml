@@ -1,0 +1,13 @@
+name: Daily EMA scan
+
+on:
+  schedule:
+    - cron: '0 15 * * *'
+  workflow_dispatch:
+
+jobs:
+  trigger:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Trigger Render scan
+        run: curl -fsS -X POST "${{ secrets.RENDER_RUN_URL }}"

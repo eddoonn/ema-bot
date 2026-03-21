@@ -85,6 +85,7 @@ YF_BATCH_CHUNK = int(os.getenv("YF_BATCH_CHUNK", 40))
 MARKET_PROXY = os.getenv("MARKET_PROXY", "SPY")
 GROWTH_PROXY = os.getenv("GROWTH_PROXY", "QQQ")
 MIN_DOLLAR_VOL_M = float(os.getenv("MIN_DOLLAR_VOL_M", 25))
+EXTRA_TICKERS = os.getenv("EXTRA_TICKERS", "")
 PULLBACK_LOOKBACK = int(os.getenv("PULLBACK_LOOKBACK", 3))
 PULLBACK_TOUCH_PCT = float(os.getenv("PULLBACK_TOUCH_PCT", 0.006))
 CLOSE_IN_RANGE_MIN = float(os.getenv("CLOSE_IN_RANGE_MIN", 0.60))
@@ -279,6 +280,53 @@ def get_sp500_tickers():
         for sym in fallback:
             SECTOR_PROXY_BY_SYMBOL.setdefault(sym, "XLK")
         return fallback
+
+def get_sp400_tickers():
+    try:
+        tables = safe_read_html("https://en.wikipedia.org/wiki/List_of_S%26P_400_companies")
+        df = tables[0]
+
+        symbol_col = "Symbol" if "Symbol" in df.columns else df.columns[0]
+        tickers = normalize_tickers(df[symbol_col].astype(str).tolist())
+
+        sector_col = "GICS Sector" if "GICS Sector" in df.columns else None
+        if sector_col:
+            for _, row in df[[symbol_col, sector_col]].dropna().iterrows():
+                sym = _normalize_ticker(row[symbol_col])
+                sector = str(row[sector_col]).strip()
+                etf = GICS_TO_ETF.get(sector)
+                if sym and etf:
+                    SECTOR_PROXY_BY_SYMBOL[sym] = etf
+
+        logging.info(f"Loaded {len(tickers)} S&P 400 tickers from Wikipedia.")
+        return tickers
+    except Exception as e:
+        logging.error(f"S&P400 fetch failed: {e}")
+        return ["DKS", "WSM", "FND", "ONTO", "RPM", "ALGN", "SCI"]
+
+
+def get_sp600_tickers():
+    try:
+        tables = safe_read_html("https://en.wikipedia.org/wiki/List_of_S%26P_600_companies")
+        df = tables[0]
+
+        symbol_col = "Symbol" if "Symbol" in df.columns else df.columns[0]
+        tickers = normalize_tickers(df[symbol_col].astype(str).tolist())
+
+        sector_col = "GICS Sector" if "GICS Sector" in df.columns else None
+        if sector_col:
+            for _, row in df[[symbol_col, sector_col]].dropna().iterrows():
+                sym = _normalize_ticker(row[symbol_col])
+                sector = str(row[sector_col]).strip()
+                etf = GICS_TO_ETF.get(sector)
+                if sym and etf:
+                    SECTOR_PROXY_BY_SYMBOL[sym] = etf
+
+        logging.info(f"Loaded {len(tickers)} S&P 600 tickers from Wikipedia.")
+        return tickers
+    except Exception as e:
+        logging.error(f"S&P600 fetch failed: {e}")
+        return ["BOOT", "INSP", "AXON", "IBP", "CROX", "SHAK", "SMPL"]
 
 def get_biotech_tickers():
     try:
@@ -1376,15 +1424,21 @@ def evaluate_old_signals():
 # ----------------------------------------------------------------------
 
 def _build_universe():
+    extra = normalize_tickers(
+        [x.strip() for x in EXTRA_TICKERS.split(",") if x.strip()]
+    )
+
     raw = (
         get_sp500_tickers()
+        + get_sp400_tickers()
+        + get_sp600_tickers()
         + get_biotech_tickers()
         + get_nasdaq100_tickers()
         + get_dow30_tickers()
         + get_sector_tickers()
+        + extra
     )
     return sorted(set(normalize_tickers(raw)))
-
 # ----------------------------------------------------------------------
 # Flask
 # ----------------------------------------------------------------------

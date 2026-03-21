@@ -1123,7 +1123,7 @@ def _compute_signal_for_df(df_daily: pd.DataFrame, trend_ctx: dict, market_ctx: 
                 sector_ctx.get("score_long", 1.0) if sector_ctx is not None else 1.0,
                 rs_ctx.get("score", 1.0),
             ]
-                confidence = round(float(np.nanmean(c_parts)), 2)
+            confidence = round(float(np.nanmean(c_parts)), 2)
             return (
                 "BUY", close, adx, confidence,
                 {

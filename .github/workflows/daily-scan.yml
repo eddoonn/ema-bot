@@ -2,7 +2,9 @@ name: Daily EMA scan
 
 on:
   schedule:
-    - cron: "0 15 * * *"
+    # 22:00 UTC is after the US cash close in both EST and EDT. Weekdays only:
+    # the signal uses that completed session and assumes entry at the next open.
+    - cron: "0 22 * * 1-5"
   workflow_dispatch:
 
 permissions:

@@ -2,7 +2,7 @@
 #  EMA Multi-Factor Scanner Bot — Precision Continuation Edition
 # ============================================================
 # Scans S&P 500/400/600 + NASDAQ-100 + Dow 30 + biotech + sector ETFs
-# Sends Discord alerts for high-selectivity pullback continuation setups
+# Ranks pullback continuation setups and sends the strongest Discord alerts
 # Uses a market-open-aligned 4H EMA200 trend filter via 1H -> 4H resampling
 # Adds market regime, sector regime, event filters, relative strength,
 # and optional OpenInsider confirmation for BUY setups.
@@ -16,8 +16,10 @@ import random
 import re
 import time
 import traceback
+from dataclasses import dataclass
 from io import StringIO
 from threading import Lock, Thread
+from zoneinfo import ZoneInfo
 
 import numpy as np
 import pandas as pd
@@ -49,12 +51,13 @@ CHECK_INTERVAL = int(os.getenv("CHECK_INTERVAL", 120))
 HOLD_DAYS = int(os.getenv("HOLD_DAYS", 5))
 CAPITAL_PER_TRADE = float(os.getenv("CAPITAL_PER_TRADE", 500))
 LOG_FILE = os.getenv("LOG_FILE", "trades_log.csv")
+RESULTS_LOG_FILE = os.getenv("RESULTS_LOG_FILE", "signal_results.csv")
+CALIBRATION_MIN_SAMPLES = int(os.getenv("CALIBRATION_MIN_SAMPLES", 20))
+RANK_SCORE_VERSION = os.getenv("RANK_SCORE_VERSION", "v1").strip() or "v1"
 
-# Stricter defaults for precision mode
+# Eligibility and ranking inputs
 ADX_MIN = float(os.getenv("ADX_MIN", 22))
 TREND_BUF = float(os.getenv("TREND_BUF", 0.995))
-CONFIRM_SCORE_BUY = int(os.getenv("CONFIRM_SCORE_BUY", 4))
-CONFIRM_SCORE_SELL = int(os.getenv("CONFIRM_SCORE_SELL", 4))
 USE_OBV = os.getenv("USE_OBV", "0") == "1"
 
 SLOPE_W = int(os.getenv("SLOPE_W", 5))
@@ -83,6 +86,9 @@ RATE_LIMIT_DELAY = float(os.getenv("RATE_LIMIT_DELAY", 0.0))
 YF_BATCH_CHUNK = int(os.getenv("YF_BATCH_CHUNK", 40))
 PROXY_CACHE_MINUTES = int(os.getenv("PROXY_CACHE_MINUTES", 15))
 BACKTEST_PERIOD = os.getenv("BACKTEST_PERIOD", "1y")
+MAX_ALERTS_PER_CYCLE = int(os.getenv("MAX_ALERTS_PER_CYCLE", 10))
+MIN_RANK_SCORE = float(os.getenv("MIN_RANK_SCORE", 0.0))
+DAILY_BAR_CLOSE_BUFFER_MINUTES = int(os.getenv("DAILY_BAR_CLOSE_BUFFER_MINUTES", 15))
 
 # Precision-mode controls
 MARKET_PROXY = os.getenv("MARKET_PROXY", "SPY")
@@ -95,11 +101,31 @@ TREND_ESTABLISHED_BARS = int(os.getenv("TREND_ESTABLISHED_BARS", 3))
 FOURH_SLOPE_BARS = int(os.getenv("FOURH_SLOPE_BARS", 5))
 FOURH_SLOPE_MIN = float(os.getenv("FOURH_SLOPE_MIN", 0.002))
 FOURH_MAX_STRETCH_ATR = float(os.getenv("FOURH_MAX_STRETCH_ATR", 4.5))
-MIN_CONFIDENCE_ALERT = float(os.getenv("MIN_CONFIDENCE_ALERT", 0.70))
 
-REQUIRE_MARKET_REGIME = os.getenv("REQUIRE_MARKET_REGIME", "1") == "1"
-REQUIRE_SECTOR_REGIME = os.getenv("REQUIRE_SECTOR_REGIME", "1") == "1"
-REQUIRE_RELATIVE_STRENGTH = os.getenv("REQUIRE_RELATIVE_STRENGTH", "1") == "1"
+USE_MARKET_REGIME_SCORE = (
+    os.getenv("USE_MARKET_REGIME_SCORE", os.getenv("REQUIRE_MARKET_REGIME", "1")) == "1"
+)
+USE_SECTOR_REGIME_SCORE = (
+    os.getenv("USE_SECTOR_REGIME_SCORE", os.getenv("REQUIRE_SECTOR_REGIME", "1")) == "1"
+)
+USE_RELATIVE_STRENGTH_SCORE = (
+    os.getenv("USE_RELATIVE_STRENGTH_SCORE", os.getenv("REQUIRE_RELATIVE_STRENGTH", "1")) == "1"
+)
+
+# Defaults deliberately remain equal-weight. Environment overrides make controlled
+# ablation possible without silently changing the production baseline in code.
+RANK_COMPONENT_WEIGHTS = {
+    "ema_slope": float(os.getenv("WEIGHT_EMA_SLOPE", 1.0)),
+    "pullback_location": float(os.getenv("WEIGHT_PULLBACK_LOCATION", 1.0)),
+    "macd_momentum": float(os.getenv("WEIGHT_MACD_MOMENTUM", 1.0)),
+    "reclaim_candle": float(os.getenv("WEIGHT_RECLAIM_CANDLE", 1.0)),
+    "trend_4h": float(os.getenv("WEIGHT_TREND_4H", 1.0)),
+    "adx_strength": float(os.getenv("WEIGHT_ADX_STRENGTH", 1.0)),
+    "obv_direction": float(os.getenv("WEIGHT_OBV_DIRECTION", 1.0)),
+    "market_regime": float(os.getenv("WEIGHT_MARKET_REGIME", 1.0)),
+    "sector_regime": float(os.getenv("WEIGHT_SECTOR_REGIME", 1.0)),
+    "relative_strength": float(os.getenv("WEIGHT_RELATIVE_STRENGTH", 1.0)),
+}
 
 RS_LOOKBACK = int(os.getenv("RS_LOOKBACK", 10))
 RS_EMA = int(os.getenv("RS_EMA", 20))
@@ -155,6 +181,22 @@ SCAN_LOCK = Lock()
 SIGNAL_LOG_LOCK = Lock()
 _RECORDED_SIGNAL_KEYS = None
 BACKOFF_RANDOM = random.SystemRandom()
+NEW_YORK_TZ = ZoneInfo("America/New_York")
+
+
+@dataclass
+class SignalCandidate:
+    """An eligible setup that can be ranked against the rest of the universe."""
+
+    symbol: str
+    side: str
+    signal_date: datetime.date
+    decision_price: float
+    adx: float
+    score: float
+    metadata: dict
+    insider_note: str = ""
+
 
 GICS_TO_ETF = {
     "Communication Services": "XLC",
@@ -308,6 +350,19 @@ def close_in_range(high, low, close):
     return (close - low) / rng
 
 
+def _weighted_rank_score(components: dict[str, float]) -> float:
+    """Combine finite score components using explicit, configurable weights."""
+    weighted_sum = 0.0
+    total_weight = 0.0
+    for name, value in components.items():
+        weight = RANK_COMPONENT_WEIGHTS.get(name, 1.0)
+        if weight <= 0 or not np.isfinite(value):
+            continue
+        weighted_sum += float(value) * weight
+        total_weight += weight
+    return float(np.clip(weighted_sum / total_weight, 0, 1)) if total_weight else 0.0
+
+
 def recent_bar_time():
     return datetime.datetime.now(datetime.timezone.utc)
 
@@ -326,8 +381,8 @@ def validate_config() -> None:
         "SCAN_BATCH_SIZE": SCAN_BATCH_SIZE,
         "BATCHES_PER_LOOP": BATCHES_PER_LOOP,
         "YF_BATCH_CHUNK": YF_BATCH_CHUNK,
-        "CONFIRM_SCORE_BUY": CONFIRM_SCORE_BUY,
-        "CONFIRM_SCORE_SELL": CONFIRM_SCORE_SELL,
+        "MAX_ALERTS_PER_CYCLE": MAX_ALERTS_PER_CYCLE,
+        "CALIBRATION_MIN_SAMPLES": CALIBRATION_MIN_SAMPLES,
         "SLOPE_W": SLOPE_W,
         "PULLBACK_LOOKBACK": PULLBACK_LOOKBACK,
         "TREND_ESTABLISHED_BARS": TREND_ESTABLISHED_BARS,
@@ -348,8 +403,8 @@ def validate_config() -> None:
         errors.append("each Z_MIN value must be <= its Z_MAX value")
     if not 0 <= CLOSE_IN_RANGE_MIN <= 1:
         errors.append("CLOSE_IN_RANGE_MIN must be between 0 and 1")
-    if not 0 <= MIN_CONFIDENCE_ALERT <= 1:
-        errors.append("MIN_CONFIDENCE_ALERT must be between 0 and 1")
+    if not 0 <= MIN_RANK_SCORE <= 1:
+        errors.append("MIN_RANK_SCORE must be between 0 and 1")
     if min(MIN_DOLLAR_VOL_M, FOURH_MAX_STRETCH_ATR) < 0:
         errors.append("volume and stretch settings cannot be negative")
     if TREND_BUF <= 0:
@@ -360,6 +415,12 @@ def validate_config() -> None:
         errors.append("BACKOFF_BASE must be > 0")
     if min(CHECK_INTERVAL, BATCH_PAUSE, RATE_LIMIT_DELAY, PROXY_CACHE_MINUTES) < 0:
         errors.append("interval, pause, delay, and cache settings cannot be negative")
+    if DAILY_BAR_CLOSE_BUFFER_MINUTES < 0:
+        errors.append("DAILY_BAR_CLOSE_BUFFER_MINUTES cannot be negative")
+    if any(weight < 0 for weight in RANK_COMPONENT_WEIGHTS.values()):
+        errors.append("ranking component weights cannot be negative")
+    if not any(weight > 0 for weight in RANK_COMPONENT_WEIGHTS.values()):
+        errors.append("at least one ranking component weight must be > 0")
 
     if errors:
         raise ValueError("Invalid configuration: " + "; ".join(errors))
@@ -772,6 +833,42 @@ def _download_single_symbol(sym: str, *, period, interval, label):
 # ----------------------------------------------------------------------
 
 
+def _drop_incomplete_daily_bar(
+    frame: pd.DataFrame, *, now: datetime.datetime | None = None
+) -> pd.DataFrame:
+    """Exclude today's Yahoo daily candle until the cash session has settled.
+
+    Yahoo can expose the current session as a mutable daily row. Signals depend on
+    the completed candle, so consuming that row before the close would make both
+    the live decision and a same-close backtest impossible to reproduce.
+    """
+    if frame.empty or not isinstance(frame.index, pd.DatetimeIndex):
+        return frame
+
+    current = now or recent_bar_time()
+    if current.tzinfo is None:
+        current = current.replace(tzinfo=datetime.timezone.utc)
+    current_new_york = current.astimezone(NEW_YORK_TZ)
+
+    latest = pd.Timestamp(frame.index[-1])
+    if latest.tzinfo is not None:
+        latest_date = latest.tz_convert(NEW_YORK_TZ).date()
+    else:
+        latest_date = latest.date()
+
+    if latest_date > current_new_york.date():
+        return frame.iloc[:-1]
+    if latest_date < current_new_york.date():
+        return frame
+
+    usable_after = datetime.datetime.combine(
+        latest_date,
+        datetime.time(16, 0),
+        tzinfo=NEW_YORK_TZ,
+    ) + datetime.timedelta(minutes=DAILY_BAR_CLOSE_BUFFER_MINUTES)
+    return frame if current_new_york >= usable_after else frame.iloc[:-1]
+
+
 def _prepare_daily_df(df_daily: pd.DataFrame) -> pd.DataFrame:
     if df_daily is None or df_daily.empty:
         return None
@@ -785,6 +882,7 @@ def _prepare_daily_df(df_daily: pd.DataFrame) -> pd.DataFrame:
     df_daily = _to_numeric_cols(df_daily.copy(), required_columns)
     df_daily = df_daily[~df_daily.index.duplicated(keep="last")].sort_index()
     df_daily = df_daily.dropna(subset=required_columns)
+    df_daily = _drop_incomplete_daily_bar(df_daily)
     if len(df_daily) < max(30, MACD_SLOW + MACD_SIGNAL):
         return None
 
@@ -808,12 +906,14 @@ def _prepare_daily_df(df_daily: pd.DataFrame) -> pd.DataFrame:
     return df_daily
 
 
-def _extract_ema_trend(df_1h: pd.DataFrame):
+def _extract_ema_trend(df_1h: pd.DataFrame, *, through_date: datetime.date | None = None):
     if df_1h is None or df_1h.empty:
         return None
 
     try:
         df_1h = _to_numeric_cols(df_1h.copy(), ["Open", "High", "Low", "Close", "Volume"])
+        if through_date is not None and isinstance(df_1h.index, pd.DatetimeIndex):
+            df_1h = df_1h[[timestamp.date() <= through_date for timestamp in df_1h.index]]
         df_4h = resample_to_4h(df_1h)
         minimum_bars = max(EMA_TREND + FOURH_SLOPE_BARS, FOURH_SLOPE_BARS + 14)
         if df_4h is None or df_4h.empty or len(df_4h) < minimum_bars:
@@ -1374,145 +1474,116 @@ def _compute_signal_for_df(
             return 0.0
         return float(np.clip(1.0 - abs(z - mid) / half, 0, 1))
 
-    market_long_ok = market_ctx.get("long_ok", False) if REQUIRE_MARKET_REGIME else True
-    market_short_ok = market_ctx.get("short_ok", False) if REQUIRE_MARKET_REGIME else True
-    sector_long_ok = (
-        bool(sector_ctx and sector_ctx.get("long_ok", False)) if REQUIRE_SECTOR_REGIME else True
-    )
-    sector_short_ok = (
-        bool(sector_ctx and sector_ctx.get("short_ok", False)) if REQUIRE_SECTOR_REGIME else True
-    )
-    rs_long_ok = (
-        (rs_ctx.get("vs_market_long", False) and rs_ctx.get("vs_sector_long", True))
-        if REQUIRE_RELATIVE_STRENGTH
-        else True
-    )
-    rs_short_ok = (
-        (rs_ctx.get("vs_market_short", False) and rs_ctx.get("vs_sector_short", True))
-        if REQUIRE_RELATIVE_STRENGTH
-        else True
-    )
-    buy_context_ok = market_long_ok and sector_long_ok and rs_long_ok
-    sell_context_ok = market_short_ok and sector_short_ok and rs_short_ok
-
     buy_setup_ok, z_dist_buy, cir_buy = _pullback_reclaim_buy(df_daily)
     sell_setup_ok, z_dist_sell, cir_sell = _pullback_reclaim_sell(df_daily)
 
     macd_accel_buy = _macd_accel_ok(True)
     macd_accel_sell = _macd_accel_ok(False)
 
-    # Regime, relative-strength, and liquidity checks are eligibility gates. The
-    # confirmation score is reserved for technical evidence so mandatory context
-    # cannot accidentally satisfy the entire threshold by itself.
-    if buy_setup_ok and trend_ctx.get("long_ok", False) and buy_context_ok and liquid_ok:
-        buy_votes = [
-            slope_21 > SLOPE_MIN_BUY,
-            Z_MIN_BUY <= z_dist_buy <= Z_MAX_BUY,
-            macd_accel_buy,
-        ]
+    def _ranked_result(side: str, z_distance: float, candle_quality: float, votes: dict):
+        long_side = side == "BUY"
+        slope_threshold = SLOPE_MIN_BUY if long_side else abs(SLOPE_MIN_SELL)
+        trend_slope = to_float(trend_ctx.get("slope_4h", 0.0))
+        components = {
+            "ema_slope": _slope_score(slope_21, slope_threshold, side),
+            "pullback_location": _z_score(
+                z_distance,
+                Z_MIN_BUY if long_side else Z_MIN_SELL,
+                Z_MAX_BUY if long_side else Z_MAX_SELL,
+            ),
+            "macd_momentum": _macd_score(long_side),
+            "reclaim_candle": float(
+                np.clip(candle_quality if long_side else 1.0 - candle_quality, 0, 1)
+            ),
+            "trend_4h": float(
+                np.clip(
+                    (abs(trend_slope) - FOURH_SLOPE_MIN) / max(2 * FOURH_SLOPE_MIN, 1e-8),
+                    0,
+                    1,
+                )
+            ),
+        }
         if USE_ADX_CONFIRM:
-            buy_votes.append(adx_rising)
+            components["adx_strength"] = _adx_score(adx)
+        if USE_OBV:
+            components["obv_direction"] = float(votes.get("obv", False))
+        if USE_MARKET_REGIME_SCORE:
+            components["market_regime"] = to_float(
+                market_ctx.get("score_long" if long_side else "score_short", 0.0)
+            )
+        if USE_SECTOR_REGIME_SCORE:
+            components["sector_regime"] = to_float(
+                (sector_ctx or {}).get("score_long" if long_side else "score_short", 0.0)
+            )
+        if USE_RELATIVE_STRENGTH_SCORE:
+            components["relative_strength"] = to_float(
+                rs_ctx.get("score_long" if long_side else "score_short", 0.0)
+            )
+
+        rank_score = round(_weighted_rank_score(components), 4)
+        context_suffix = "long" if long_side else "short"
+        return (
+            side,
+            close,
+            adx,
+            rank_score,
+            {
+                "setup": "PULLBACK_RECLAIM",
+                "trend4h_slope": round(trend_slope, 4),
+                "z_dist": round(z_distance, 2),
+                "market_score": market_ctx.get(f"score_{context_suffix}", 0.0),
+                "sector_score": (sector_ctx or {}).get(f"score_{context_suffix}", 0.0),
+                "rs_score": rs_ctx.get(f"score_{context_suffix}", 0.0),
+                "avg_dollar_vol_m": round(avg_dollar_vol, 1),
+                "technical_votes": sum(bool(value) for value in votes.values()),
+                "technical_vote_count": len(votes),
+                "technical_evidence": votes,
+                "score_components": {
+                    name: round(float(value), 4) for name, value in components.items()
+                },
+            },
+        )
+
+    # The setup, stock trend, and liquidity remain eligibility gates. Technical and
+    # broader context indicators contribute continuous ranking evidence instead of
+    # forming brittle all-confirmations vetoes.
+    if buy_setup_ok and trend_ctx.get("long_ok", False) and liquid_ok:
+        buy_votes = {
+            "ema_slope": slope_21 > SLOPE_MIN_BUY,
+            "pullback_location": Z_MIN_BUY <= z_dist_buy <= Z_MAX_BUY,
+            "macd_momentum": macd_accel_buy,
+        }
+        if USE_ADX_CONFIRM:
+            buy_votes["adx_strength"] = adx_rising
         if USE_OBV:
             obv = df_daily.get("obv")
-            buy_votes.append(
-                bool(
-                    obv is not None
-                    and len(obv) > 5
-                    and np.isfinite(to_float(obv.iloc[-1]))
-                    and np.isfinite(to_float(obv.iloc[-5]))
-                    and to_float(obv.iloc[-1]) > to_float(obv.iloc[-5])
-                )
+            buy_votes["obv"] = bool(
+                obv is not None
+                and len(obv) > 5
+                and np.isfinite(to_float(obv.iloc[-1]))
+                and np.isfinite(to_float(obv.iloc[-5]))
+                and to_float(obv.iloc[-1]) > to_float(obv.iloc[-5])
             )
+        return _ranked_result("BUY", z_dist_buy, cir_buy, buy_votes)
 
-        required_buy_votes = min(CONFIRM_SCORE_BUY, len(buy_votes))
-        if sum(bool(v) for v in buy_votes) >= required_buy_votes:
-            c_parts = [
-                _slope_score(slope_21, SLOPE_MIN_BUY, "BUY"),
-                _z_score(z_dist_buy, Z_MIN_BUY, Z_MAX_BUY),
-                _macd_score(True),
-                float(np.clip(cir_buy, 0, 1)),
-            ]
-            if USE_ADX_CONFIRM:
-                c_parts.append(_adx_score(adx))
-            if REQUIRE_MARKET_REGIME:
-                c_parts.append(market_ctx.get("score_long", 0.0))
-            if REQUIRE_SECTOR_REGIME:
-                c_parts.append(sector_ctx.get("score_long", 0.0))
-            if REQUIRE_RELATIVE_STRENGTH:
-                c_parts.append(rs_ctx.get("score_long", 0.0))
-            confidence = round(float(np.nanmean(c_parts)), 2)
-            return (
-                "BUY",
-                close,
-                adx,
-                confidence,
-                {
-                    "setup": "PULLBACK_RECLAIM",
-                    "trend4h_slope": round(trend_ctx.get("slope_4h", 0.0), 4),
-                    "z_dist": round(z_dist_buy, 2),
-                    "market_score": market_ctx.get("score_long", 0.0),
-                    "sector_score": sector_ctx.get("score_long", 0.0)
-                    if sector_ctx is not None
-                    else 1.0,
-                    "rs_score": rs_ctx.get("score_long", 0.0),
-                    "avg_dollar_vol_m": round(avg_dollar_vol, 1),
-                },
-            )
-
-    if sell_setup_ok and trend_ctx.get("short_ok", False) and sell_context_ok and liquid_ok:
-        sell_votes = [
-            slope_21 < SLOPE_MIN_SELL,
-            Z_MIN_SELL <= z_dist_sell <= Z_MAX_SELL,
-            macd_accel_sell,
-        ]
+    if sell_setup_ok and trend_ctx.get("short_ok", False) and liquid_ok:
+        sell_votes = {
+            "ema_slope": slope_21 < SLOPE_MIN_SELL,
+            "pullback_location": Z_MIN_SELL <= z_dist_sell <= Z_MAX_SELL,
+            "macd_momentum": macd_accel_sell,
+        }
         if USE_ADX_CONFIRM:
-            sell_votes.append(adx_rising)
+            sell_votes["adx_strength"] = adx_rising
         if USE_OBV:
             obv = df_daily.get("obv")
-            sell_votes.append(
-                bool(
-                    obv is not None
-                    and len(obv) > 5
-                    and np.isfinite(to_float(obv.iloc[-1]))
-                    and np.isfinite(to_float(obv.iloc[-5]))
-                    and to_float(obv.iloc[-1]) < to_float(obv.iloc[-5])
-                )
+            sell_votes["obv"] = bool(
+                obv is not None
+                and len(obv) > 5
+                and np.isfinite(to_float(obv.iloc[-1]))
+                and np.isfinite(to_float(obv.iloc[-5]))
+                and to_float(obv.iloc[-1]) < to_float(obv.iloc[-5])
             )
-
-        required_sell_votes = min(CONFIRM_SCORE_SELL, len(sell_votes))
-        if sum(bool(v) for v in sell_votes) >= required_sell_votes:
-            c_parts = [
-                _slope_score(slope_21, abs(SLOPE_MIN_SELL), "SELL"),
-                _z_score(z_dist_sell, Z_MIN_SELL, Z_MAX_SELL),
-                _macd_score(False),
-                float(np.clip(1.0 - cir_sell, 0, 1)),
-            ]
-            if USE_ADX_CONFIRM:
-                c_parts.append(_adx_score(adx))
-            if REQUIRE_MARKET_REGIME:
-                c_parts.append(market_ctx.get("score_short", 0.0))
-            if REQUIRE_SECTOR_REGIME:
-                c_parts.append(sector_ctx.get("score_short", 0.0))
-            if REQUIRE_RELATIVE_STRENGTH:
-                c_parts.append(rs_ctx.get("score_short", 0.0))
-            confidence = round(float(np.nanmean(c_parts)), 2)
-            return (
-                "SELL",
-                close,
-                adx,
-                confidence,
-                {
-                    "setup": "PULLBACK_RECLAIM",
-                    "trend4h_slope": round(trend_ctx.get("slope_4h", 0.0), 4),
-                    "z_dist": round(z_dist_sell, 2),
-                    "market_score": market_ctx.get("score_short", 0.0),
-                    "sector_score": sector_ctx.get("score_short", 0.0)
-                    if sector_ctx is not None
-                    else 1.0,
-                    "rs_score": rs_ctx.get("score_short", 0.0),
-                    "avg_dollar_vol_m": round(avg_dollar_vol, 1),
-                },
-            )
+        return _ranked_result("SELL", z_dist_sell, cir_sell, sell_votes)
 
     return None
 
@@ -1561,7 +1632,12 @@ def _fetch_proxy_maps_for_batch(batch):
 
         for proxy in stale_proxies:
             prepared = _prepare_daily_df(daily.get(proxy))
-            trend = _extract_ema_trend(h1.get(proxy))
+            through_date = None
+            if prepared is not None and not prepared.empty:
+                last_index = pd.to_datetime(prepared.index[-1], errors="coerce")
+                if not pd.isna(last_index):
+                    through_date = last_index.date()
+            trend = _extract_ema_trend(h1.get(proxy), through_date=through_date)
             PROXY_CACHE[proxy] = {
                 "cached_at": now,
                 "daily": prepared,
@@ -1619,7 +1695,7 @@ def _scan_symbol(
     market_df,
     market_regime,
 ):
-    """Evaluate one symbol from a batch and return one de-duplicated alert."""
+    """Evaluate one symbol and return an eligible, unpersisted candidate."""
     df_daily = daily_map.get(sym)
     df_1h = h1_map.get(sym)
 
@@ -1642,7 +1718,11 @@ def _scan_symbol(
     if df_daily is None or len(df_daily) < max(EMA_SLOW, 100):
         return None
 
-    trend_ctx = _extract_ema_trend(df_1h)
+    signal_timestamp = pd.to_datetime(df_daily.index[-1], errors="coerce")
+    if pd.isna(signal_timestamp):
+        return None
+    signal_date = signal_timestamp.date()
+    trend_ctx = _extract_ema_trend(df_1h, through_date=signal_date)
     if not trend_ctx:
         return None
 
@@ -1661,7 +1741,7 @@ def _scan_symbol(
     if signal is None:
         return None
 
-    side, close, adx, confidence, meta = signal
+    side, close, adx, rank_score, meta = signal
     insider_ctx = (
         get_openinsider_context(sym)
         if ENABLE_OPENINSIDER and (side == "BUY" or sym in BIOTECH_SYMBOLS)
@@ -1672,39 +1752,46 @@ def _scan_symbol(
         logging.info(f"Skipping {sym} {side}: {event_reason}")
         return None
 
-    # OpenInsider is a BUY confidence booster and biotech gate, not a hard SELL confirmer.
+    # OpenInsider can lift a BUY's rank and remains a biotech gate; it is not a
+    # hard SELL confirmer.
     if side == "BUY" and insider_ctx and insider_ctx.get("available"):
-        confidence = round(min(1.0, confidence + 0.15 * insider_ctx.get("bullish_score", 0.0)), 2)
+        insider_score = float(np.clip(insider_ctx.get("bullish_score", 0.0), 0, 1))
+        rank_score = round(min(1.0, rank_score + 0.15 * insider_score), 4)
         meta["openinsider_score"] = insider_ctx.get("bullish_score", 0.0)
         meta["openinsider_bullish_cluster"] = insider_ctx.get("bullish_buy_cluster", False)
         meta["openinsider_recent_buy_value"] = insider_ctx.get("recent_buy_value", 0.0)
 
-    if confidence < MIN_CONFIDENCE_ALERT:
-        logging.info(f"Skipping low-confidence {sym} signal ({confidence:.2f})")
+    if rank_score < MIN_RANK_SCORE:
+        logging.info(f"Skipping {sym} below optional rank floor ({rank_score:.3f})")
         return None
 
+    insider_note = ""
     if side == "BUY":
-        insider_note = ""
         if insider_ctx and insider_ctx.get("bullish_buy_cluster"):
             insider_note = f" | OI {insider_ctx.get('bullish_score', 0):.2f}"
-        message = f"BUY {sym} @ {close:.2f} | ADX {adx:.1f}, CONF {confidence:.2f}{insider_note}"
-    elif side == "SELL":
-        message = f"SELL {sym} @ {close:.2f} | ADX {adx:.1f}, CONF {confidence:.2f}"
-    else:
+    elif side != "SELL":
         return None
 
-    if not record_signal(side, sym, close, confidence, meta):
-        logging.debug(f"Skipping duplicate {side} signal for {sym} today")
-        return None
-    return message
+    meta["signal_date"] = signal_date.isoformat()
+    meta["entry_rule"] = "NEXT_SESSION_OPEN"
+    return SignalCandidate(
+        symbol=sym,
+        side=side,
+        signal_date=signal_date,
+        decision_price=close,
+        adx=adx,
+        score=rank_score,
+        metadata=meta,
+        insider_note=insider_note,
+    )
 
 
 def _scan_tickers_batched_unlocked(tickers, *, offset=0, batch_size=SCAN_BATCH_SIZE):
-    conf_signals = []
+    candidates = []
 
     n = len(tickers)
     if n == 0:
-        return conf_signals, offset, True
+        return candidates, offset, True
 
     start = offset % n
     batch, next_offset, completed_cycle = _select_batch(tickers, offset, batch_size)
@@ -1742,7 +1829,7 @@ def _scan_tickers_batched_unlocked(tickers, *, offset=0, batch_size=SCAN_BATCH_S
     except Exception as e:
         LAST_SCAN_SUMMARY["last_error"] = f"Batch download failed: {e}"
         logging.warning(f"Batch download failed: {e}")
-        return conf_signals, next_offset, completed_cycle
+        return candidates, next_offset, completed_cycle
 
     market_df = proxy_daily_map.get(MARKET_PROXY)
     market_regime = proxy_regime_map.get(
@@ -1751,7 +1838,7 @@ def _scan_tickers_batched_unlocked(tickers, *, offset=0, batch_size=SCAN_BATCH_S
 
     for sym in batch:
         try:
-            message = _scan_symbol(
+            candidate = _scan_symbol(
                 sym,
                 daily_map,
                 h1_map,
@@ -1765,11 +1852,99 @@ def _scan_tickers_batched_unlocked(tickers, *, offset=0, batch_size=SCAN_BATCH_S
             logging.warning(f"Skipping {sym} after scanner error: {exc}", exc_info=True)
             continue
 
-        if message:
-            conf_signals.append(message)
+        if candidate:
+            candidates.append(candidate)
 
-    LAST_SCAN_SUMMARY["signals_in_batch"] = len(conf_signals)
-    return conf_signals, next_offset, completed_cycle
+    candidates.sort(key=lambda item: (-item.score, item.symbol, item.side))
+    LAST_SCAN_SUMMARY["signals_in_batch"] = len(candidates)
+    return candidates, next_offset, completed_cycle
+
+
+def _next_open_entry_is_pending(
+    signal_date: datetime.date, *, now: datetime.datetime | None = None
+) -> bool:
+    """Return whether the first regular open after the signal is still tradable."""
+    current = now or recent_bar_time()
+    if current.tzinfo is None:
+        current = current.replace(tzinfo=datetime.timezone.utc)
+    current_new_york = current.astimezone(NEW_YORK_TZ)
+
+    if signal_date > current_new_york.date():
+        return False
+    if signal_date == current_new_york.date():
+        usable_after = datetime.datetime.combine(
+            signal_date,
+            datetime.time(16, 0),
+            tzinfo=NEW_YORK_TZ,
+        ) + datetime.timedelta(minutes=DAILY_BAR_CLOSE_BUFFER_MINUTES)
+        return current_new_york >= usable_after
+
+    # Before a weekday open, or throughout a weekend, the next available cash
+    # session has not started. The daily scheduler normally uses the same-date path.
+    if current_new_york.weekday() >= 5:
+        return True
+    return current_new_york.time() < datetime.time(9, 30)
+
+
+def _finalize_ranked_candidates(
+    candidates: list[SignalCandidate], *, now: datetime.datetime | None = None
+) -> list[str]:
+    """Persist and format the best candidates from one complete universe pass."""
+    ranked = sorted(candidates, key=lambda item: (-item.score, item.symbol, item.side))
+    try:
+        results_history = _read_results_log()
+    except Exception as exc:
+        logging.warning(f"Could not read historical results for alert calibration: {exc}")
+        results_history = pd.DataFrame()
+
+    alerts = []
+    for candidate in ranked:
+        if len(alerts) >= MAX_ALERTS_PER_CYCLE:
+            break
+        if not _next_open_entry_is_pending(candidate.signal_date, now=now):
+            logging.info(
+                f"Skipping stale {candidate.side} candidate for {candidate.symbol}: "
+                f"the next-open entry window after {candidate.signal_date} has passed"
+            )
+            continue
+
+        rank = len(alerts) + 1
+        metadata = dict(candidate.metadata)
+        metadata["universe_rank"] = rank
+        recorded = record_signal(
+            candidate.side,
+            candidate.symbol,
+            candidate.decision_price,
+            candidate.score,
+            metadata,
+            signal_date=candidate.signal_date,
+        )
+        if not recorded:
+            logging.debug(
+                f"Skipping duplicate {candidate.side} signal for {candidate.symbol} "
+                f"on {candidate.signal_date}"
+            )
+            continue
+
+        votes = metadata.get("technical_votes", 0)
+        vote_count = metadata.get("technical_vote_count", 0)
+        empirical = _empirical_win_context(
+            candidate.score,
+            candidate.side,
+            results_history,
+        )
+        empirical_note = ""
+        if empirical:
+            empirical_note = (
+                f" | HIST {HOLD_DAYS}S {empirical['win_rate']:.0%} (n={empirical['samples']})"
+            )
+        alerts.append(
+            f"#{rank} {candidate.side} {candidate.symbol} | SCORE {candidate.score:.3f} | "
+            f"decision close {candidate.decision_price:.2f} | entry next open | "
+            f"ADX {candidate.adx:.1f} | TECH {votes}/{vote_count}"
+            f"{empirical_note}{candidate.insider_note}"
+        )
+    return alerts
 
 
 # ----------------------------------------------------------------------
@@ -1789,7 +1964,89 @@ def _read_signal_log() -> pd.DataFrame:
     return pd.read_csv(LOG_FILE)
 
 
-def record_signal(signal_type, sym, price, confidence=None, meta=None):
+def _read_results_log() -> pd.DataFrame:
+    if not os.path.exists(RESULTS_LOG_FILE) or os.path.getsize(RESULTS_LOG_FILE) == 0:
+        return pd.DataFrame()
+    return pd.read_csv(RESULTS_LOG_FILE)
+
+
+def _write_csv_atomic(frame: pd.DataFrame, path: str) -> None:
+    """Replace one CSV only after its complete successor is on the same filesystem."""
+    absolute_path = os.path.abspath(path)
+    os.makedirs(os.path.dirname(absolute_path), exist_ok=True)
+    temporary_path = f"{absolute_path}.tmp"
+    try:
+        frame.to_csv(temporary_path, index=False)
+        os.replace(temporary_path, absolute_path)
+    except Exception:
+        if os.path.exists(temporary_path):
+            os.remove(temporary_path)
+        raise
+
+
+def _persist_signal_results(records: list[dict]) -> pd.DataFrame:
+    """Idempotently add evaluated signals to the permanent outcome ledger."""
+    existing = _read_results_log()
+    if not records:
+        return existing
+
+    new_rows = pd.DataFrame(records)
+    combined = pd.concat([existing, new_rows], ignore_index=True, sort=False)
+    key_columns = ["signal_date", "signal", "symbol", "hold_sessions"]
+    missing = set(key_columns).difference(combined.columns)
+    if missing:
+        raise ValueError(f"Results ledger is missing key columns: {sorted(missing)}")
+
+    combined = combined.drop_duplicates(key_columns, keep="last")
+    combined = combined.sort_values(key_columns).reset_index(drop=True)
+    _write_csv_atomic(combined, RESULTS_LOG_FILE)
+    return combined
+
+
+def _empirical_win_context(
+    score: float,
+    side: str,
+    results: pd.DataFrame,
+) -> dict | None:
+    """Return same-side historical win rate for the candidate's 10-point score band."""
+    required = {"score", "score_version", "signal", "hold_sessions", "return_decimal"}
+    if results.empty or not required.issubset(results.columns) or not np.isfinite(score):
+        return None
+
+    history = results.copy()
+    history["score"] = pd.to_numeric(history["score"], errors="coerce")
+    history["hold_sessions"] = pd.to_numeric(history["hold_sessions"], errors="coerce")
+    history["return_decimal"] = pd.to_numeric(history["return_decimal"], errors="coerce")
+    band_index = min(max(int(score * 10), 0), 9)
+    lower = band_index / 10.0
+    upper = lower + 0.1
+    upper_match = history["score"].le(upper) if band_index == 9 else history["score"].lt(upper)
+    matching = history[
+        history["score"].ge(lower)
+        & upper_match
+        & history["score_version"].eq(RANK_SCORE_VERSION)
+        & history["signal"].astype(str).str.upper().eq(str(side).upper())
+        & history["hold_sessions"].eq(HOLD_DAYS)
+    ].dropna(subset=["return_decimal"])
+    if len(matching) < CALIBRATION_MIN_SAMPLES:
+        return None
+
+    return {
+        "win_rate": float((matching["return_decimal"] > 0).mean()),
+        "samples": len(matching),
+        "score_band": f"{lower:.1f}-{upper:.1f}",
+    }
+
+
+def record_signal(
+    signal_type,
+    sym,
+    price,
+    score=None,
+    meta=None,
+    *,
+    signal_date: datetime.date | None = None,
+):
     """Append a signal once per symbol, side, and trading date.
 
     The scanner revisits a symbol throughout the day. Persisted de-duplication
@@ -1797,20 +2054,35 @@ def record_signal(signal_type, sym, price, confidence=None, meta=None):
     """
     global _RECORDED_SIGNAL_KEYS
 
-    date = datetime.date.today().isoformat()
+    date = (signal_date or datetime.date.today()).isoformat()
     key = _signal_key(date, signal_type, sym)
     data = {
         "date": date,
         "signal": signal_type,
         "symbol": sym,
+        "decision_price": float(price),
+        # Retain `price` for compatibility with existing logs and reports.
         "price": float(price),
-        "confidence": float(confidence) if confidence is not None else np.nan,
+        "score": float(score) if score is not None else np.nan,
+        "score_version": RANK_SCORE_VERSION,
+        # Retain the historical column while deployed logs transition to `score`.
+        "confidence": float(score) if score is not None else np.nan,
         "setup": (meta or {}).get("setup", ""),
         "trend4h_slope": (meta or {}).get("trend4h_slope", np.nan),
         "market_score": (meta or {}).get("market_score", np.nan),
         "sector_score": (meta or {}).get("sector_score", np.nan),
         "rs_score": (meta or {}).get("rs_score", np.nan),
+        "technical_votes": (meta or {}).get("technical_votes", np.nan),
+        "technical_vote_count": (meta or {}).get("technical_vote_count", np.nan),
+        "entry_rule": (meta or {}).get("entry_rule", "NEXT_SESSION_OPEN"),
+        "universe_rank": (meta or {}).get("universe_rank", np.nan),
     }
+    # Persist the decomposition, not just the composite, so later iterations can
+    # audit and ablate rank inputs without attempting to reconstruct live context.
+    for name, value in (meta or {}).get("score_components", {}).items():
+        data[f"component_{name}"] = value
+    for name, passed in (meta or {}).get("technical_evidence", {}).items():
+        data[f"evidence_{name}"] = bool(passed)
 
     with SIGNAL_LOG_LOCK:
         if _RECORDED_SIGNAL_KEYS is None:
@@ -1834,13 +2106,17 @@ def record_signal(signal_type, sym, price, confidence=None, meta=None):
 
         log_directory = os.path.dirname(os.path.abspath(LOG_FILE))
         os.makedirs(log_directory, exist_ok=True)
-        has_content = os.path.exists(LOG_FILE) and os.path.getsize(LOG_FILE) > 0
-        pd.DataFrame([data]).to_csv(
-            LOG_FILE,
-            mode="a" if has_content else "w",
-            header=not has_content,
-            index=False,
+        existing = _read_signal_log()
+        output_columns = list(data)
+        if len(existing.columns):
+            output_columns = list(dict.fromkeys([*existing.columns, *data]))
+        existing = existing.reindex(columns=output_columns)
+        row = {column: data.get(column, np.nan) for column in output_columns}
+        updated = pd.concat(
+            [existing, pd.DataFrame([row], columns=output_columns)],
+            ignore_index=True,
         )
+        _write_csv_atomic(updated, LOG_FILE)
         _RECORDED_SIGNAL_KEYS.add(key)
         return True
 
@@ -1856,7 +2132,7 @@ def evaluate_old_signals():
     if df.empty:
         return None
 
-    required_columns = {"date", "signal", "symbol", "price"}
+    required_columns = {"date", "signal", "symbol"}
     if not required_columns.issubset(df.columns):
         logging.error(
             f"Signal log is missing columns: {sorted(required_columns - set(df.columns))}"
@@ -1864,10 +2140,13 @@ def evaluate_old_signals():
         return None
 
     df["date"] = pd.to_datetime(df["date"], errors="coerce")
-    df["price"] = pd.to_numeric(df["price"], errors="coerce")
+    if "price" in df.columns:
+        df["price"] = pd.to_numeric(df["price"], errors="coerce")
     if "confidence" in df.columns:
         df["confidence"] = pd.to_numeric(df["confidence"], errors="coerce")
-    df = df.dropna(subset=["date", "price", "signal", "symbol"])
+    if "score" in df.columns:
+        df["score"] = pd.to_numeric(df["score"], errors="coerce")
+    df = df.dropna(subset=["date", "signal", "symbol"])
 
     cutoff = datetime.date.today() - datetime.timedelta(days=HOLD_DAYS)
     eligible = df[df["date"].dt.date <= cutoff].copy()
@@ -1883,18 +2162,22 @@ def evaluate_old_signals():
     )
 
     results = []
+    result_records = []
     evaluated_keys = set()
     hold_bars = max(HOLD_DAYS, 1)
+    evaluated_at = datetime.datetime.now(datetime.timezone.utc).isoformat()
 
     for _, row in eligible.iterrows():
         sym = str(row["symbol"])
         side = str(row["signal"])
-        entry = to_float(row["price"])
         signal_date = row["date"].date()
+        logged_score = to_float(row.get("score", np.nan))
+        if not np.isfinite(logged_score):
+            logged_score = to_float(row.get("confidence", np.nan))
 
         try:
             df_hist = history_map.get(sym)
-            if df_hist is None or df_hist.empty or "Close" not in df_hist.columns:
+            if df_hist is None or df_hist.empty or not {"Open", "Close"}.issubset(df_hist.columns):
                 continue
 
             history = df_hist.copy()
@@ -1904,6 +2187,7 @@ def evaluate_old_signals():
             if len(future_bars) < hold_bars:
                 continue
 
+            entry = to_float(future_bars["Open"].iloc[0])
             exit_price = to_float(future_bars["Close"].iloc[hold_bars - 1])
             if not np.isfinite(entry) or entry <= 0 or not np.isfinite(exit_price):
                 continue
@@ -1912,6 +2196,8 @@ def evaluate_old_signals():
             if side.upper() == "SELL":
                 ret = -ret
             profit = ret * CAPITAL_PER_TRADE
+            entry_date = pd.Timestamp(future_bars.index[0]).date().isoformat()
+            exit_date = pd.Timestamp(future_bars.index[hold_bars - 1]).date().isoformat()
             results.append(
                 (
                     sym,
@@ -1919,9 +2205,29 @@ def evaluate_old_signals():
                     float(entry),
                     float(exit_price),
                     float(profit),
-                    row.get("confidence", np.nan),
+                    logged_score,
                     row.get("setup", ""),
                 )
+            )
+            result_records.append(
+                {
+                    "evaluated_at": evaluated_at,
+                    "signal_date": signal_date.isoformat(),
+                    "entry_date": entry_date,
+                    "exit_date": exit_date,
+                    "signal": side.upper(),
+                    "symbol": sym.upper(),
+                    "decision_price": to_float(row.get("decision_price", row.get("price", np.nan))),
+                    "entry_price": float(entry),
+                    "exit_price": float(exit_price),
+                    "hold_sessions": hold_bars,
+                    "return_decimal": float(ret),
+                    "profit_usd": float(profit),
+                    "score": logged_score,
+                    "score_version": row.get("score_version", "legacy"),
+                    "universe_rank": to_float(row.get("universe_rank", np.nan)),
+                    "setup": row.get("setup", ""),
+                }
             )
             evaluated_keys.add(_signal_key(signal_date, side, sym))
         except Exception as e:
@@ -1930,31 +2236,37 @@ def evaluate_old_signals():
     if not results:
         return None
 
-    total = sum(p[4] for p in results)
-    winrate = sum(1 for p in results if p[4] > 0) / len(results) * 100
-    avg_trade = total / len(results)
-    finite_confidences = [p[5] for p in results if np.isfinite(to_float(p[5]))]
-    avg_conf = float(np.mean(finite_confidences)) if finite_confidences else np.nan
-
-    msg = "**Weekly Performance Report**\n"
-    for sym, side, entry, exitp, prof, conf, setup in results:
-        emoji = "WIN" if prof > 0 else "LOSS"
-        msg += f"{emoji} {sym} {side} {entry:.2f} -> {exitp:.2f} | {prof:+.2f} USD | C {conf:.2f} | {setup}\n"
-    msg += f"\nTotal: {total:+.2f} USD | Winrate: {winrate:.1f}% | Avg: {avg_trade:+.2f} USD/trade | AvgConf: {avg_conf:.2f}"
-
+    results_history = pd.DataFrame()
     try:
         with SIGNAL_LOG_LOCK:
+            results_history = _persist_signal_results(result_records)
             current = _read_signal_log()
             if not current.empty and required_columns.issubset(current.columns):
                 keep = [
                     _signal_key(row["date"], row["signal"], row["symbol"]) not in evaluated_keys
                     for _, row in current.iterrows()
                 ]
-                current.loc[keep].to_csv(LOG_FILE, index=False)
+                _write_csv_atomic(current.loc[keep], LOG_FILE)
                 if _RECORDED_SIGNAL_KEYS is not None:
                     _RECORDED_SIGNAL_KEYS.difference_update(evaluated_keys)
     except Exception as e:
-        logging.error(f"Failed to update log file: {e}")
+        # Pending signals remain available for a safe retry if the permanent
+        # outcome ledger or queue update cannot be completed.
+        logging.error(f"Failed to persist evaluated signals: {e}")
+
+    total = sum(p[4] for p in results)
+    winrate = sum(1 for p in results if p[4] > 0) / len(results) * 100
+    avg_trade = total / len(results)
+    finite_scores = [p[5] for p in results if np.isfinite(to_float(p[5]))]
+    average_score = float(np.mean(finite_scores)) if finite_scores else np.nan
+
+    msg = "**Weekly Performance Report (next-open entries)**\n"
+    for sym, side, entry, exitp, prof, score, setup in results:
+        emoji = "WIN" if prof > 0 else "LOSS"
+        msg += f"{emoji} {sym} {side} {entry:.2f} -> {exitp:.2f} | {prof:+.2f} USD | Score {score:.3f} | {setup}\n"
+    msg += f"\nTotal: {total:+.2f} USD | Winrate: {winrate:.1f}% | Avg: {avg_trade:+.2f} USD/trade | AvgScore: {average_score:.3f}"
+    if not results_history.empty:
+        msg += f" | Historical outcomes: {len(results_history)}"
 
     return msg
 
@@ -1980,34 +2292,41 @@ def _build_universe():
     return sorted(set(normalize_tickers(raw)))
 
 
-def _scan_and_notify_segment(tickers, offset, *, log_prefix=""):
-    """Scan the configured number of batches and send any resulting alerts."""
-    total_signals = 0
+def _scan_segment(tickers, offset, *, log_prefix=""):
+    """Scan configured batches and return candidates for universe-wide ranking."""
+    candidates = []
     completed_cycle = False
     batches = max(1, BATCHES_PER_LOOP)
 
     for index in range(batches):
-        conf_signals, offset, batch_completed = scan_tickers_batched(
+        batch_candidates, offset, batch_completed = scan_tickers_batched(
             tickers,
             offset=offset,
             batch_size=SCAN_BATCH_SIZE,
         )
         completed_cycle = completed_cycle or batch_completed
-        total_signals += len(conf_signals)
-
-        if conf_signals:
-            now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M")
-            message = f"**EMA Precision Alerts ({now})**\n" + "\n".join(conf_signals)
-            send_discord_message(message)
+        candidates.extend(batch_candidates)
 
         if index < batches - 1 and not completed_cycle and BATCH_PAUSE > 0:
             time.sleep(BATCH_PAUSE)
         if completed_cycle:
             break
 
-    if total_signals == 0:
-        logging.info(f"{log_prefix}No signals in this pass segment")
-    return offset, completed_cycle
+    if not candidates:
+        logging.info(f"{log_prefix}No candidates in this pass segment")
+    return candidates, offset, completed_cycle
+
+
+def _send_ranked_alerts(candidates: list[SignalCandidate]) -> int:
+    alerts = _finalize_ranked_candidates(candidates)
+    if not alerts:
+        logging.info("No new ranked alerts after de-duplication")
+        return 0
+
+    now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M")
+    message = f"**EMA Ranked Alerts ({now})**\n" + "\n".join(alerts)
+    send_discord_message(message)
+    return len(alerts)
 
 
 def _send_performance_report():
@@ -2031,15 +2350,18 @@ def run_one_full_pass(*, lock_already_acquired=False):
 
         offset = 0
         completed_cycle = not tickers
+        cycle_candidates = []
         while not completed_cycle:
-            offset, completed_cycle = _scan_and_notify_segment(
+            candidates, offset, completed_cycle = _scan_segment(
                 tickers,
                 offset,
                 log_prefix="Manual run: ",
             )
+            cycle_candidates.extend(candidates)
             if not completed_cycle and BATCH_PAUSE > 0:
                 time.sleep(BATCH_PAUSE)
 
+        _send_ranked_alerts(cycle_candidates)
         _send_performance_report()
         logging.info("Manual run: completed one full pass through the universe.")
         return True
@@ -2116,7 +2438,7 @@ def main():
         logging.info(f"4H resample rule: {RESAMPLE_4H_RULE}")
         logging.info(f"4H resample offset: {RESAMPLE_4H_OFFSET}")
         logging.info(f"Trend period for 1H history: {TREND_PERIOD}")
-        send_discord_message("Bot online and scanning high-selectivity continuation setups.")
+        send_discord_message("Bot online and ranking completed-session continuation setups.")
     except Exception as e:
         logging.error(f"Failed to build ticker universe: {e}")
         raise
@@ -2125,12 +2447,16 @@ def main():
     LAST_SCAN_SUMMARY["universe_size"] = len(tickers)
 
     offset = 0
+    cycle_candidates = []
 
     while True:
         completed_cycle = False
         try:
-            offset, completed_cycle = _scan_and_notify_segment(tickers, offset)
+            candidates, offset, completed_cycle = _scan_segment(tickers, offset)
+            cycle_candidates.extend(candidates)
             if completed_cycle:
+                _send_ranked_alerts(cycle_candidates)
+                cycle_candidates = []
                 _send_performance_report()
 
         except Exception as e:

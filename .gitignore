@@ -7,3 +7,5 @@ htmlcov/
 .venv/
 .env
 trades_log.csv
+signal_results.csv
+*.csv.tmp

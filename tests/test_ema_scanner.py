@@ -36,6 +36,18 @@ def test_validate_config_reports_multiple_invalid_settings(monkeypatch):
     assert "SCAN_BATCH_SIZE must be > 0" in str(error.value)
 
 
+def test_rank_components_use_configurable_weights(monkeypatch):
+    monkeypatch.setattr(
+        scanner,
+        "RANK_COMPONENT_WEIGHTS",
+        {"strong": 3.0, "weak": 1.0, "disabled": 0.0},
+    )
+
+    score = scanner._weighted_rank_score({"strong": 1.0, "weak": 0.0, "disabled": 1.0})
+
+    assert score == pytest.approx(0.75)
+
+
 def test_resample_to_4h_anchors_candles_at_market_open(monkeypatch):
     monkeypatch.setattr(scanner, "RESAMPLE_4H_RULE", "4h")
     monkeypatch.setattr(scanner, "RESAMPLE_4H_OFFSET", "9h30min")
@@ -118,7 +130,7 @@ def test_nasdaq100_parser_uses_official_nested_rows(monkeypatch):
     assert tickers[:2] == ["T000", "T001"]
 
 
-def test_required_market_regime_is_a_hard_signal_gate(monkeypatch):
+def test_market_regime_ranks_candidates_but_liquidity_remains_a_gate(monkeypatch):
     rows = 120
     macd_hist = np.full(rows, 0.1)
     macd_hist[-4:] = [0.1, 0.2, 0.3, 0.4]
@@ -139,25 +151,23 @@ def test_required_market_regime_is_a_hard_signal_gate(monkeypatch):
 
     monkeypatch.setattr(scanner, "_pullback_reclaim_buy", lambda _frame: (True, 0.0, 0.9))
     monkeypatch.setattr(scanner, "_pullback_reclaim_sell", lambda _frame: (False, 0.0, 0.0))
-    monkeypatch.setattr(scanner, "REQUIRE_MARKET_REGIME", True)
-    monkeypatch.setattr(scanner, "REQUIRE_SECTOR_REGIME", False)
-    monkeypatch.setattr(scanner, "REQUIRE_RELATIVE_STRENGTH", False)
+    monkeypatch.setattr(scanner, "USE_MARKET_REGIME_SCORE", True)
+    monkeypatch.setattr(scanner, "USE_SECTOR_REGIME_SCORE", False)
+    monkeypatch.setattr(scanner, "USE_RELATIVE_STRENGTH_SCORE", False)
     monkeypatch.setattr(scanner, "USE_OBV", False)
 
     trend = {"long_ok": True, "short_ok": False, "slope_4h": 0.01}
     blocked_market = {"long_ok": False, "short_ok": False, "score_long": 0.0}
     relative_strength = {"score_long": 1.0, "score_short": 0.0}
 
-    assert (
-        scanner._compute_signal_for_df(
-            frame.copy(),
-            trend,
-            blocked_market,
-            None,
-            relative_strength,
-        )
-        is None
+    weak_signal = scanner._compute_signal_for_df(
+        frame.copy(),
+        trend,
+        blocked_market,
+        None,
+        relative_strength,
     )
+    assert weak_signal is not None
 
     allowed_market = {"long_ok": True, "short_ok": False, "score_long": 1.0}
     signal = scanner._compute_signal_for_df(
@@ -169,6 +179,7 @@ def test_required_market_regime_is_a_hard_signal_gate(monkeypatch):
     )
     assert signal is not None
     assert signal[0] == "BUY"
+    assert signal[3] > weak_signal[3]
 
     illiquid = frame.copy()
     illiquid["avg_dollar_vol_20"] = 0.0
@@ -184,6 +195,58 @@ def test_required_market_regime_is_a_hard_signal_gate(monkeypatch):
     )
 
 
+def test_technical_confirmations_rank_but_do_not_veto_setup(monkeypatch):
+    rows = 120
+    frame = pd.DataFrame(
+        {
+            "Close": np.linspace(100, 110, rows),
+            "adx": np.full(rows, 10.0),
+            "atr": np.full(rows, 2.0),
+            "macd_hist": np.full(rows, -0.1),
+            "ema_slow": np.full(rows, 100.0),
+            "avg_dollar_vol_20": np.full(rows, 100.0),
+        }
+    )
+    monkeypatch.setattr(scanner, "_pullback_reclaim_buy", lambda _frame: (True, 2.0, 0.9))
+    monkeypatch.setattr(scanner, "_pullback_reclaim_sell", lambda _frame: (False, 0.0, 0.0))
+    monkeypatch.setattr(scanner, "USE_MARKET_REGIME_SCORE", False)
+    monkeypatch.setattr(scanner, "USE_SECTOR_REGIME_SCORE", False)
+    monkeypatch.setattr(scanner, "USE_RELATIVE_STRENGTH_SCORE", False)
+    monkeypatch.setattr(scanner, "USE_ADX_CONFIRM", True)
+    monkeypatch.setattr(scanner, "USE_OBV", False)
+
+    signal = scanner._compute_signal_for_df(
+        frame,
+        {"long_ok": True, "short_ok": False, "slope_4h": scanner.FOURH_SLOPE_MIN},
+        {},
+        None,
+        {},
+    )
+
+    assert signal is not None
+    assert signal[0] == "BUY"
+    assert 0 <= signal[3] <= 1
+    assert signal[4]["technical_votes"] == 0
+    assert signal[4]["technical_vote_count"] == 4
+
+
+def test_incomplete_daily_bar_is_not_eligible_until_after_close(monkeypatch):
+    monkeypatch.setattr(scanner, "DAILY_BAR_CLOSE_BUFFER_MINUTES", 15)
+    frame = pd.DataFrame(
+        {"Close": [100.0, 101.0]},
+        index=pd.to_datetime(["2026-07-17", "2026-07-20"]),
+    )
+
+    before_close = datetime.datetime(2026, 7, 20, 15, 59, tzinfo=scanner.NEW_YORK_TZ)
+    after_buffer = datetime.datetime(2026, 7, 20, 16, 15, tzinfo=scanner.NEW_YORK_TZ)
+
+    assert list(scanner._drop_incomplete_daily_bar(frame, now=before_close)["Close"]) == [100.0]
+    assert list(scanner._drop_incomplete_daily_bar(frame, now=after_buffer)["Close"]) == [
+        100.0,
+        101.0,
+    ]
+
+
 def test_proxy_context_is_reused_until_cache_expiry(monkeypatch):
     scanner.PROXY_CACHE.clear()
     monkeypatch.setattr(scanner, "MARKET_PROXY", "SPY")
@@ -197,7 +260,11 @@ def test_proxy_context_is_reused_until_cache_expiry(monkeypatch):
 
     monkeypatch.setattr(scanner, "_download_batch_chunked", fake_download)
     monkeypatch.setattr(scanner, "_prepare_daily_df", lambda frame: frame)
-    monkeypatch.setattr(scanner, "_extract_ema_trend", lambda _frame: {"long_ok": True})
+    monkeypatch.setattr(
+        scanner,
+        "_extract_ema_trend",
+        lambda _frame, **_kwargs: {"long_ok": True},
+    )
     monkeypatch.setattr(
         scanner,
         "build_regime_context",
@@ -209,6 +276,49 @@ def test_proxy_context_is_reused_until_cache_expiry(monkeypatch):
 
     assert first == second
     assert len(calls) == 2  # one daily and one hourly request, only on the first call
+
+
+def test_scan_symbol_aligns_trend_and_returns_unpersisted_candidate(monkeypatch):
+    signal_date = datetime.date(2026, 7, 17)
+    prepared = pd.DataFrame(
+        {"Close": np.linspace(90.0, 100.0, 120)},
+        index=pd.bdate_range(end=signal_date, periods=120),
+    )
+    observed = {}
+
+    monkeypatch.setattr(scanner, "_prepare_daily_df", lambda _frame: prepared)
+
+    def fake_trend(_frame, *, through_date=None):
+        observed["through_date"] = through_date
+        return {"long_ok": True}
+
+    monkeypatch.setattr(scanner, "_extract_ema_trend", fake_trend)
+    monkeypatch.setattr(scanner, "infer_sector_proxy", lambda _symbol: None)
+    monkeypatch.setattr(scanner, "compute_relative_strength_context", lambda *_args: {})
+    monkeypatch.setattr(
+        scanner,
+        "_compute_signal_for_df",
+        lambda *_args: ("BUY", 100.0, 25.0, 0.6, {"setup": "TEST"}),
+    )
+    monkeypatch.setattr(scanner, "passes_event_filter", lambda *_args: (True, "ok"))
+    monkeypatch.setattr(scanner, "ENABLE_OPENINSIDER", False)
+    monkeypatch.setattr(scanner, "MIN_RANK_SCORE", 0.0)
+
+    candidate = scanner._scan_symbol(
+        "AAPL",
+        {"AAPL": pd.DataFrame({"Close": [1.0]})},
+        {"AAPL": pd.DataFrame({"Close": [1.0]})},
+        {},
+        {},
+        pd.DataFrame({"Close": [1.0]}),
+        {},
+    )
+
+    assert isinstance(candidate, scanner.SignalCandidate)
+    assert candidate.signal_date == signal_date
+    assert candidate.score == 0.6
+    assert candidate.metadata["entry_rule"] == "NEXT_SESSION_OPEN"
+    assert observed["through_date"] == signal_date
 
 
 def test_batch_continues_after_one_symbol_raises(monkeypatch):
@@ -226,7 +336,15 @@ def test_batch_continues_after_one_symbol_raises(monkeypatch):
     def fake_scan_symbol(symbol, *_args):
         if symbol == "BAD":
             raise ValueError("bad data")
-        return f"alert:{symbol}"
+        return scanner.SignalCandidate(
+            symbol=symbol,
+            side="BUY",
+            signal_date=datetime.date(2026, 7, 17),
+            decision_price=100.0,
+            adx=25.0,
+            score=0.5,
+            metadata={},
+        )
 
     monkeypatch.setattr(scanner, "_scan_symbol", fake_scan_symbol)
 
@@ -235,7 +353,7 @@ def test_batch_continues_after_one_symbol_raises(monkeypatch):
         batch_size=2,
     )
 
-    assert signals == ["alert:GOOD"]
+    assert [candidate.symbol for candidate in signals] == ["GOOD"]
     assert next_offset == 0
     assert completed is True
     assert "BAD: ValueError: bad data" in scanner.LAST_SCAN_SUMMARY["last_error"]
@@ -254,6 +372,92 @@ def test_record_signal_deduplicates_across_repeated_scans(tmp_path, monkeypatch)
     assert saved.iloc[0]["price"] == 200.0
 
 
+def test_ranked_candidates_are_sorted_capped_and_logged_for_next_open(tmp_path, monkeypatch):
+    log_path = tmp_path / "ranked-signals.csv"
+    results_path = tmp_path / "ranked-results.csv"
+    monkeypatch.setattr(scanner, "LOG_FILE", str(log_path))
+    monkeypatch.setattr(scanner, "RESULTS_LOG_FILE", str(results_path))
+    monkeypatch.setattr(scanner, "MAX_ALERTS_PER_CYCLE", 2)
+    monkeypatch.setattr(scanner, "CALIBRATION_MIN_SAMPLES", 2)
+    monkeypatch.setattr(scanner, "HOLD_DAYS", 5)
+    monkeypatch.setattr(scanner, "RANK_SCORE_VERSION", "v1")
+    monkeypatch.setattr(scanner, "_RECORDED_SIGNAL_KEYS", None)
+    signal_date = datetime.date(2026, 7, 17)
+    pd.DataFrame(
+        {
+            "score": [0.91, 0.92],
+            "score_version": ["v1", "v1"],
+            "signal": ["BUY", "BUY"],
+            "hold_sessions": [5, 5],
+            "return_decimal": [0.01, -0.01],
+        }
+    ).to_csv(results_path, index=False)
+
+    candidates = [
+        scanner.SignalCandidate(
+            symbol=symbol,
+            side="BUY",
+            signal_date=signal_date,
+            decision_price=price,
+            adx=25.0,
+            score=score,
+            metadata={
+                "technical_votes": 1,
+                "technical_vote_count": 4,
+                "score_components": {"ema_slope": score},
+                "technical_evidence": {"ema_slope": True},
+            },
+        )
+        for symbol, price, score in (
+            ("LOW", 10.0, 0.2),
+            ("TOP", 20.0, 0.9),
+            ("MID", 30.0, 0.6),
+        )
+    ]
+
+    alerts = scanner._finalize_ranked_candidates(
+        candidates,
+        now=datetime.datetime(2026, 7, 17, 17, 0, tzinfo=scanner.NEW_YORK_TZ),
+    )
+
+    assert [alert.split()[2] for alert in alerts] == ["TOP", "MID"]
+    assert all("entry next open" in alert for alert in alerts)
+    assert "HIST 5S 50% (n=2)" in alerts[0]
+    assert "HIST" not in alerts[1]
+    saved = pd.read_csv(log_path)
+    assert list(saved["symbol"]) == ["TOP", "MID"]
+    assert list(saved["entry_rule"]) == ["NEXT_SESSION_OPEN", "NEXT_SESSION_OPEN"]
+    assert list(saved["universe_rank"]) == [1, 2]
+    assert list(saved["decision_price"]) == [20.0, 30.0]
+    assert list(saved["component_ema_slope"]) == [0.9, 0.6]
+    assert saved["evidence_ema_slope"].all()
+    assert set(saved["date"]) == {signal_date.isoformat()}
+
+
+def test_ranked_candidate_is_not_alerted_after_its_next_open(tmp_path, monkeypatch):
+    log_path = tmp_path / "stale-signals.csv"
+    monkeypatch.setattr(scanner, "LOG_FILE", str(log_path))
+    monkeypatch.setattr(scanner, "RESULTS_LOG_FILE", str(tmp_path / "stale-results.csv"))
+    monkeypatch.setattr(scanner, "_RECORDED_SIGNAL_KEYS", None)
+    candidate = scanner.SignalCandidate(
+        symbol="LATE",
+        side="BUY",
+        signal_date=datetime.date(2026, 7, 17),
+        decision_price=20.0,
+        adx=25.0,
+        score=0.8,
+        metadata={},
+    )
+
+    alerts = scanner._finalize_ranked_candidates(
+        [candidate],
+        now=datetime.datetime(2026, 7, 20, 10, 0, tzinfo=scanner.NEW_YORK_TZ),
+    )
+
+    assert alerts == []
+    assert not log_path.exists()
+
+
 def test_record_signal_refuses_to_append_to_malformed_log(tmp_path, monkeypatch):
     log_path = tmp_path / "signals.csv"
     original = "wrong,columns\n1,2\n"
@@ -263,6 +467,39 @@ def test_record_signal_refuses_to_append_to_malformed_log(tmp_path, monkeypatch)
 
     assert scanner.record_signal("BUY", "AAPL", 200.0) is False
     assert log_path.read_text(encoding="utf-8") == original
+
+
+def test_record_signal_migrates_legacy_log_columns(tmp_path, monkeypatch):
+    log_path = tmp_path / "legacy-signals.csv"
+    pd.DataFrame(
+        [
+            {
+                "date": "2026-07-16",
+                "signal": "BUY",
+                "symbol": "OLD",
+                "price": 10.0,
+                "confidence": 0.5,
+                "setup": "TEST",
+            }
+        ]
+    ).to_csv(log_path, index=False)
+    monkeypatch.setattr(scanner, "LOG_FILE", str(log_path))
+    monkeypatch.setattr(scanner, "_RECORDED_SIGNAL_KEYS", None)
+
+    assert scanner.record_signal(
+        "BUY",
+        "NEW",
+        20.0,
+        0.7,
+        {"entry_rule": "NEXT_SESSION_OPEN"},
+        signal_date=datetime.date(2026, 7, 17),
+    )
+
+    migrated = pd.read_csv(log_path)
+    assert list(migrated["symbol"]) == ["OLD", "NEW"]
+    assert "score" in migrated.columns
+    assert migrated.loc[migrated["symbol"] == "NEW", "score"].iloc[0] == 0.7
+    assert migrated.loc[migrated["symbol"] == "OLD", "confidence"].iloc[0] == 0.5
 
 
 def test_evaluate_old_signals_uses_bars_after_the_signal_date(tmp_path, monkeypatch):
@@ -290,7 +527,10 @@ def test_evaluate_old_signals_uses_bars_after_the_signal_date(tmp_path, monkeypa
         ]
     )
     history = pd.DataFrame(
-        {"Close": [90, 95, 100, 101, 102, 103, 104, 105, 106]},
+        {
+            "Open": [90, 95, 100, 102, 103, 104, 105, 106, 107],
+            "Close": [90, 95, 100, 103, 104, 105, 106, 107, 108],
+        },
         index=index,
     )
 
@@ -301,6 +541,8 @@ def test_evaluate_old_signals_uses_bars_after_the_signal_date(tmp_path, monkeypa
         return {"AAPL": history}
 
     monkeypatch.setattr(scanner, "LOG_FILE", str(log_path))
+    results_path = tmp_path / "signal-results.csv"
+    monkeypatch.setattr(scanner, "RESULTS_LOG_FILE", str(results_path))
     monkeypatch.setattr(scanner, "HOLD_DAYS", 5)
     monkeypatch.setattr(scanner, "CAPITAL_PER_TRADE", 500.0)
     monkeypatch.setattr(scanner, "_RECORDED_SIGNAL_KEYS", None)
@@ -308,9 +550,56 @@ def test_evaluate_old_signals_uses_bars_after_the_signal_date(tmp_path, monkeypa
 
     report = scanner.evaluate_old_signals()
 
-    assert "100.00 -> 105.00" in report
-    assert "+25.00 USD" in report
+    assert "next-open entries" in report
+    assert "102.00 -> 107.00" in report
+    assert "+24.51 USD" in report
     assert pd.read_csv(log_path).empty
+    saved_results = pd.read_csv(results_path)
+    assert len(saved_results) == 1
+    assert saved_results.iloc[0]["entry_price"] == 102.0
+    assert saved_results.iloc[0]["exit_price"] == 107.0
+    assert saved_results.iloc[0]["return_decimal"] == pytest.approx(5 / 102)
+
+
+def test_result_ledger_is_idempotent_and_keeps_latest_evaluation(tmp_path, monkeypatch):
+    results_path = tmp_path / "results.csv"
+    monkeypatch.setattr(scanner, "RESULTS_LOG_FILE", str(results_path))
+    base = {
+        "signal_date": "2026-07-17",
+        "signal": "BUY",
+        "symbol": "AAPL",
+        "hold_sessions": 5,
+        "return_decimal": 0.01,
+    }
+
+    scanner._persist_signal_results([base])
+    updated = dict(base, return_decimal=0.02)
+    ledger = scanner._persist_signal_results([updated])
+
+    assert len(ledger) == 1
+    assert ledger.iloc[0]["return_decimal"] == 0.02
+    assert pd.read_csv(results_path).iloc[0]["return_decimal"] == 0.02
+
+
+def test_empirical_win_context_requires_same_side_version_and_sample_size(monkeypatch):
+    monkeypatch.setattr(scanner, "CALIBRATION_MIN_SAMPLES", 20)
+    monkeypatch.setattr(scanner, "HOLD_DAYS", 5)
+    monkeypatch.setattr(scanner, "RANK_SCORE_VERSION", "v1")
+    history = pd.DataFrame(
+        {
+            "score": [0.45] * 20,
+            "score_version": ["v1"] * 20,
+            "signal": ["BUY"] * 20,
+            "hold_sessions": [5] * 20,
+            "return_decimal": [0.01] * 12 + [-0.01] * 8,
+        }
+    )
+
+    context = scanner._empirical_win_context(0.49, "BUY", history)
+
+    assert context == {"win_rate": 0.6, "samples": 20, "score_band": "0.4-0.5"}
+    assert scanner._empirical_win_context(0.49, "SELL", history) is None
+    assert scanner._empirical_win_context(0.59, "BUY", history) is None
 
 
 def test_discord_messages_are_split_without_exceeding_limit():

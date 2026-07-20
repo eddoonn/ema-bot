@@ -1,0 +1,27 @@
+name: Daily EMA scan
+
+on:
+  schedule:
+    - cron: "0 15 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  trigger:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Trigger Render scan
+        env:
+          RENDER_RUN_URL: ${{ secrets.RENDER_RUN_URL }}
+          RUN_TOKEN: ${{ secrets.RUN_TOKEN }}
+        run: |
+          test -n "$RENDER_RUN_URL"
+          test -n "$RUN_TOKEN"
+          curl --fail --show-error --silent \
+            --retry 3 \
+            --retry-all-errors \
+            --request POST \
+            --header "X-Run-Token: $RUN_TOKEN" \
+            "$RENDER_RUN_URL"

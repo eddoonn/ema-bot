@@ -241,9 +241,7 @@ def _precompute_symbol_trends(
     """
     if hourly is None or hourly.empty or not signal_dates:
         return {}
-    source = scanner._to_numeric_cols(
-        hourly.copy(), ["Open", "High", "Low", "Close", "Volume"]
-    )
+    source = scanner._to_numeric_cols(hourly.copy(), ["Open", "High", "Low", "Close", "Volume"])
     fourh = scanner.resample_to_4h(source)
     minimum_bars = max(
         scanner.EMA_TREND + scanner.FOURH_SLOPE_BARS,

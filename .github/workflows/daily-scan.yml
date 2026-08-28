@@ -29,8 +29,10 @@ jobs:
           RENDER_RUN_URL: ${{ secrets.RENDER_RUN_URL }}
           RUN_TOKEN: ${{ secrets.RUN_TOKEN }}
         run: |
-          test -n "$RENDER_RUN_URL"
-          test -n "$RUN_TOKEN"
+          if [ -z "$RENDER_RUN_URL" ] || [ -z "$RUN_TOKEN" ]; then
+            echo "Skipping Render trigger — RENDER_RUN_URL or RUN_TOKEN not set"
+            exit 0
+          fi
           curl --fail --show-error --silent \
             --retry 3 \
             --retry-all-errors \

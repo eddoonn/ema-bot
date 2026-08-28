@@ -761,7 +761,7 @@ def test_discord_messages_are_split_without_exceeding_limit():
     assert all(len(chunk) <= 100 for chunk in chunks)
 
 
-def test_trade_messages_use_pinned_webhook(monkeypatch):
+def test_trade_messages_use_configured_webhook(monkeypatch):
     calls = []
 
     class Response:
@@ -774,11 +774,25 @@ def test_trade_messages_use_pinned_webhook(monkeypatch):
 
     monkeypatch.setattr(scanner.requests, "post", fake_post)
     monkeypatch.setattr(scanner, "DISCORD_WEBHOOK", "https://example.invalid/old-status-hook")
+    monkeypatch.setattr(scanner, "TRADE_DISCORD_WEBHOOK", "https://example.invalid/trade-hook")
 
     scanner.send_trade_discord_message("trade")
 
     assert [url for url, _kwargs in calls] == [scanner.TRADE_DISCORD_WEBHOOK]
     assert calls[0][1]["json"] == {"content": "trade"}
+
+
+def test_trade_messages_do_not_fall_back_to_status_webhook(monkeypatch):
+    calls = []
+    monkeypatch.setattr(
+        scanner.requests, "post", lambda *args, **kwargs: calls.append((args, kwargs))
+    )
+    monkeypatch.setattr(scanner, "TRADE_DISCORD_WEBHOOK", "")
+    monkeypatch.setattr(scanner, "DISCORD_WEBHOOK", "https://example.invalid/status-hook")
+
+    scanner.send_trade_discord_message("trade")
+
+    assert calls == []
 
 
 def test_alerts_and_performance_reports_use_trade_sender(monkeypatch):

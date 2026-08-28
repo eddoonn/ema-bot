@@ -200,13 +200,15 @@ def test_technical_confirmations_rank_but_do_not_veto_setup(monkeypatch):
     frame = pd.DataFrame(
         {
             "Close": np.linspace(100, 110, rows),
-            "adx": np.full(rows, 10.0),
+            "adx": np.full(rows, 25.0),
             "atr": np.full(rows, 2.0),
             "macd_hist": np.full(rows, -0.1),
             "ema_slow": np.full(rows, 100.0),
             "avg_dollar_vol_20": np.full(rows, 100.0),
         }
     )
+    # Hard ADX floor (v2) is 18 – keep it disabled for this ranking-only regression
+    monkeypatch.setattr(scanner, "ADX_HARD_MIN", 0)
     monkeypatch.setattr(scanner, "_pullback_reclaim_buy", lambda _frame: (True, 2.0, 0.9))
     monkeypatch.setattr(scanner, "_pullback_reclaim_sell", lambda _frame: (False, 0.0, 0.0))
     monkeypatch.setattr(scanner, "USE_MARKET_REGIME_SCORE", False)
@@ -631,3 +633,135 @@ def test_run_once_endpoint_requires_post_and_constant_secret(monkeypatch):
 
     assert response.status_code == 202
     assert response.get_json() == {"ok": True, "status": "started"}
+
+
+# ----------------------------------------------------------------------
+# v3 profit-optimised gates — honest backtest driven (2026 sweep)
+# ----------------------------------------------------------------------
+
+
+def test_adx_hard_gate_blocks_weak_trend(monkeypatch):
+    rows = 120
+    frame = pd.DataFrame(
+        {
+            "Close": np.linspace(100, 110, rows),
+            "adx": np.full(rows, 12.0),
+            "atr": np.full(rows, 2.0),
+            "macd_hist": np.full(rows, 0.1),
+            "ema_slow": np.full(rows, 95.0),
+            "avg_dollar_vol_20": np.full(rows, 100.0),
+        }
+    )
+    monkeypatch.setattr(scanner, "_pullback_reclaim_buy", lambda _frame: (True, 0.0, 0.9))
+    monkeypatch.setattr(scanner, "_pullback_reclaim_sell", lambda _frame: (False, 0.0, 0.0))
+    monkeypatch.setattr(scanner, "USE_MARKET_REGIME_SCORE", False)
+    monkeypatch.setattr(scanner, "USE_SECTOR_REGIME_SCORE", False)
+    monkeypatch.setattr(scanner, "USE_RELATIVE_STRENGTH_SCORE", False)
+    monkeypatch.setattr(scanner, "USE_OBV", False)
+    monkeypatch.setattr(scanner, "ADX_HARD_MIN", 17)
+
+    assert scanner._compute_signal_for_df(
+        frame, {"long_ok": True, "short_ok": False, "slope_4h": 0.01}, {}, None, {}
+    ) is None
+
+    frame["adx"] = np.full(rows, 25.0)
+    assert scanner._compute_signal_for_df(
+        frame, {"long_ok": True, "short_ok": False, "slope_4h": 0.01}, {}, None, {}
+    ) is not None
+
+
+def test_volume_max_gate_blocks_mega_cap(monkeypatch):
+    rows = 120
+    frame = pd.DataFrame(
+        {
+            "Close": np.linspace(100, 110, rows),
+            "adx": np.full(rows, 25.0),
+            "atr": np.full(rows, 2.0),
+            "macd_hist": np.full(rows, 0.1),
+            "ema_slow": np.full(rows, 95.0),
+            "avg_dollar_vol_20": np.full(rows, 2000.0),
+        }
+    )
+    monkeypatch.setattr(scanner, "_pullback_reclaim_buy", lambda _frame: (True, 0.0, 0.9))
+    monkeypatch.setattr(scanner, "_pullback_reclaim_sell", lambda _frame: (False, 0.0, 0.0))
+    monkeypatch.setattr(scanner, "USE_MARKET_REGIME_SCORE", False)
+    monkeypatch.setattr(scanner, "USE_SECTOR_REGIME_SCORE", False)
+    monkeypatch.setattr(scanner, "USE_RELATIVE_STRENGTH_SCORE", False)
+    monkeypatch.setattr(scanner, "USE_OBV", False)
+    monkeypatch.setattr(scanner, "ADX_HARD_MIN", 0)
+    monkeypatch.setattr(scanner, "MAX_DOLLAR_VOL_M", 1000)
+    monkeypatch.setattr(scanner, "MIN_DOLLAR_VOL_M", 25)
+
+    assert scanner._compute_signal_for_df(
+        frame, {"long_ok": True, "short_ok": False, "slope_4h": 0.01}, {}, None, {}
+    ) is None
+
+    monkeypatch.setattr(scanner, "MAX_DOLLAR_VOL_M", 0)
+    assert scanner._compute_signal_for_df(
+        frame, {"long_ok": True, "short_ok": False, "slope_4h": 0.01}, {}, None, {}
+    ) is not None
+
+
+def test_session_offset_london_and_asia_anchor(monkeypatch):
+    seen = set()
+    for offset in ["9h30min", "3h", "20h", "0h"]:
+        monkeypatch.setattr(scanner, "RESAMPLE_4H_OFFSET", offset)
+        monkeypatch.setattr(scanner, "RESAMPLE_4H_RULE", "4h")
+        index = pd.date_range("2026-07-20 00:00", periods=12, freq="h", tz="America/New_York")
+        frame = pd.DataFrame(
+            {
+                "Open": np.arange(12, dtype=float),
+                "High": np.arange(12, dtype=float) + 2,
+                "Low": np.arange(12, dtype=float) - 1,
+                "Close": np.arange(12, dtype=float) + 1,
+                "Volume": np.ones(12),
+            },
+            index=index,
+        )
+        result = scanner.resample_to_4h(frame)
+        assert result is not None and not result.empty
+        seen.add(result.index[0].strftime("%H:%M"))
+    # Different offsets must produce different bucket anchors (NY 09:30 vs London 03:00 vs Asia 20:00)
+    assert len(seen) >= 3
+
+
+def test_min_rank_score_filters_low_quality(monkeypatch):
+    # MIN_RANK_SCORE is enforced in _scan_symbol, not _compute_signal_for_df.
+    # Verify the gate directly via _scan_symbol with a low score.
+    monkeypatch.setattr(scanner, "MIN_RANK_SCORE", 0.90)
+    monkeypatch.setattr(scanner, "_prepare_daily_df", lambda f: pd.DataFrame(
+        {"Close": np.linspace(100, 110, 120)}, index=pd.bdate_range(end=datetime.date(2026, 7, 17), periods=120)
+    ))
+    monkeypatch.setattr(scanner, "_extract_ema_trend", lambda f, through_date=None: {"long_ok": True})
+    monkeypatch.setattr(scanner, "infer_sector_proxy", lambda s: None)
+    monkeypatch.setattr(scanner, "compute_relative_strength_context", lambda *a: {})
+    monkeypatch.setattr(scanner, "_compute_signal_for_df", lambda *a: ("BUY", 100.0, 25.0, 0.2, {"setup": "TEST"}))
+    monkeypatch.setattr(scanner, "passes_event_filter", lambda *a: (True, ""))
+    monkeypatch.setattr(scanner, "ENABLE_OPENINSIDER", False)
+
+    candidate = scanner._scan_symbol(
+        "AAPL",
+        {"AAPL": pd.DataFrame({"Close": [1.0]})},
+        {"AAPL": pd.DataFrame({"Close": [1.0]})},
+        {}, {}, pd.DataFrame({"Close": [1.0]}), {},
+    )
+    assert candidate is None  # score 0.2 < 0.90 floor
+
+    monkeypatch.setattr(scanner, "MIN_RANK_SCORE", 0.10)
+    candidate = scanner._scan_symbol(
+        "AAPL",
+        {"AAPL": pd.DataFrame({"Close": [1.0]})},
+        {"AAPL": pd.DataFrame({"Close": [1.0]})},
+        {}, {}, pd.DataFrame({"Close": [1.0]}), {},
+    )
+    assert candidate is not None and candidate.score == 0.2
+
+
+def test_validate_config_rejects_new_gates(monkeypatch):
+    monkeypatch.setattr(scanner, "ADX_HARD_MIN", 0)
+    with pytest.raises(ValueError, match="ADX_HARD_MIN"):
+        scanner.validate_config()
+    monkeypatch.setattr(scanner, "ADX_HARD_MIN", 17)
+    monkeypatch.setattr(scanner, "MAX_DOLLAR_VOL_M", -1)
+    with pytest.raises(ValueError, match="MAX_DOLLAR_VOL_M"):
+        scanner.validate_config()

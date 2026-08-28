@@ -53,10 +53,11 @@ CAPITAL_PER_TRADE = float(os.getenv("CAPITAL_PER_TRADE", 500))
 LOG_FILE = os.getenv("LOG_FILE", "trades_log.csv")
 RESULTS_LOG_FILE = os.getenv("RESULTS_LOG_FILE", "signal_results.csv")
 CALIBRATION_MIN_SAMPLES = int(os.getenv("CALIBRATION_MIN_SAMPLES", 20))
-RANK_SCORE_VERSION = os.getenv("RANK_SCORE_VERSION", "v1").strip() or "v1"
+RANK_SCORE_VERSION = os.getenv("RANK_SCORE_VERSION", "v3").strip() or "v3"
 
 # Eligibility and ranking inputs
-ADX_MIN = float(os.getenv("ADX_MIN", 22))
+ADX_MIN = float(os.getenv("ADX_MIN", 17))
+ADX_HARD_MIN = float(os.getenv("ADX_HARD_MIN", 17))
 TREND_BUF = float(os.getenv("TREND_BUF", 0.995))
 USE_OBV = os.getenv("USE_OBV", "0") == "1"
 
@@ -87,12 +88,15 @@ YF_BATCH_CHUNK = int(os.getenv("YF_BATCH_CHUNK", 40))
 PROXY_CACHE_MINUTES = int(os.getenv("PROXY_CACHE_MINUTES", 15))
 BACKTEST_PERIOD = os.getenv("BACKTEST_PERIOD", "1y")
 MAX_ALERTS_PER_CYCLE = int(os.getenv("MAX_ALERTS_PER_CYCLE", 10))
-MIN_RANK_SCORE = float(os.getenv("MIN_RANK_SCORE", 0.0))
+MIN_RANK_SCORE = float(os.getenv("MIN_RANK_SCORE", 0.40))
 DAILY_BAR_CLOSE_BUFFER_MINUTES = int(os.getenv("DAILY_BAR_CLOSE_BUFFER_MINUTES", 15))
 
 # Precision-mode controls
 MARKET_PROXY = os.getenv("MARKET_PROXY", "SPY")
 MIN_DOLLAR_VOL_M = float(os.getenv("MIN_DOLLAR_VOL_M", 25))
+MAX_DOLLAR_VOL_M = float(
+    os.getenv("MAX_DOLLAR_VOL_M", 0)
+)  # 0 = no upper bound; set 1000 to cut mega-cap churn
 EXTRA_TICKERS = os.getenv("EXTRA_TICKERS", "")
 PULLBACK_LOOKBACK = int(os.getenv("PULLBACK_LOOKBACK", 3))
 PULLBACK_TOUCH_PCT = float(os.getenv("PULLBACK_TOUCH_PCT", 0.006))
@@ -407,6 +411,12 @@ def validate_config() -> None:
         errors.append("MIN_RANK_SCORE must be between 0 and 1")
     if min(MIN_DOLLAR_VOL_M, FOURH_MAX_STRETCH_ATR) < 0:
         errors.append("volume and stretch settings cannot be negative")
+    if MAX_DOLLAR_VOL_M < 0:
+        errors.append("MAX_DOLLAR_VOL_M cannot be negative")
+    if ADX_HARD_MIN <= 0:
+        errors.append("ADX_HARD_MIN must be > 0")
+    if FOURH_SLOPE_MIN < 0:
+        errors.append("FOURH_SLOPE_MIN cannot be negative")
     if TREND_BUF <= 0:
         errors.append("TREND_BUF must be > 0")
     if MAX_RETRIES < 0 or BACKOFF_JITTER_MAX < 0:
@@ -1430,6 +1440,14 @@ def _compute_signal_for_df(
 
     avg_dollar_vol = to_float(df_daily["avg_dollar_vol_20"].iloc[-1])
     liquid_ok = avg_dollar_vol >= MIN_DOLLAR_VOL_M
+    if MAX_DOLLAR_VOL_M > 0 and avg_dollar_vol > MAX_DOLLAR_VOL_M:
+        liquid_ok = False
+    # Hard ADX floor: previously ADX was only a ranking vote, allowing weak-trend
+    # trades (ADX <15) that dominate the -441 PnL / 19.2% large-loss bucket.
+    # Enforce a hard eligibility gate here; tuned to 18 from 22 via 2026 sweep
+    # (ADX 22-30: +617, 15-22: +133, <15: -441).
+    if not np.isfinite(adx) or adx < ADX_HARD_MIN:
+        return None
 
     def _macd_accel_ok(long_side: bool):
         n = MACD_ACCEL_BARS

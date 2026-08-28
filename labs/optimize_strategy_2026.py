@@ -217,11 +217,9 @@ def summarize(trades: pd.DataFrame) -> dict:
     values = trades["r_multiple"].astype(float)
     gross_win = float(values[values > 0].sum())
     gross_loss = abs(float(values[values < 0].sum()))
-    monthly = (
-        trades.assign(month=trades["signal_date"].str.slice(0, 7))
-        .groupby("month")["r_multiple"]
-        .sum()
-    )
+    monthly = trades.assign(month=trades["signal_date"].str.slice(0, 7)).groupby("month")[
+        "r_multiple"
+    ].sum()
     standard_error = float(values.std(ddof=1) / math.sqrt(len(values))) if len(values) > 1 else 0
     return {
         "trades": len(trades),
@@ -254,20 +252,12 @@ def _variant_grid():
 
 
 def _record(variant: Variant, period: str, trades: pd.DataFrame) -> dict:
-    return {
-        "variant": variant.name,
-        **dataclasses.asdict(variant),
-        "period": period,
-        **summarize(trades),
-    }
+    return {"variant": variant.name, **dataclasses.asdict(variant), "period": period, **summarize(trades)}
 
 
 def descriptive_tables(baseline: pd.DataFrame) -> None:
     specifications = {
-        "weekday": (
-            baseline["signal_weekday"],
-            ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday"],
-        ),
+        "weekday": (baseline["signal_weekday"], ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday"]),
         "volume_band": (
             pd.cut(
                 baseline["avg_dollar_vol_m"],
@@ -276,14 +266,8 @@ def descriptive_tables(baseline: pd.DataFrame) -> None:
             ).astype(str),
             None,
         ),
-        "score_band": (
-            pd.cut(baseline["score"], [0.4, 0.45, 0.5, 0.55, 0.6, 1.01], right=False).astype(str),
-            None,
-        ),
-        "adx_band": (
-            pd.cut(baseline["adx"], [18, 20, 22, 25, 30, 40, 101], right=False).astype(str),
-            None,
-        ),
+        "score_band": (pd.cut(baseline["score"], [0.4, 0.45, 0.5, 0.55, 0.6, 1.01], right=False).astype(str), None),
+        "adx_band": (pd.cut(baseline["adx"], [18, 20, 22, 25, 30, 40, 101], right=False).astype(str), None),
         "earnings_distance": (
             np.select(
                 [
@@ -343,10 +327,7 @@ def main() -> int:
     ].copy()
     eligible = eligible.merge(
         training[["variant", "lcb_mean_r", "positive_month_pct"]].rename(
-            columns={
-                "lcb_mean_r": "training_lcb",
-                "positive_month_pct": "training_positive_month_pct",
-            }
+            columns={"lcb_mean_r": "training_lcb", "positive_month_pct": "training_positive_month_pct"}
         ),
         on="variant",
     )
@@ -415,14 +396,8 @@ def main() -> int:
     (OUTPUT_DIR / "optimization.json").write_text(
         json.dumps(report, indent=2, sort_keys=True) + "\n", encoding="utf-8"
     )
-    print(
-        json.dumps({key: value for key, value in report.items() if key != "comparison"}, indent=2)
-    )
-    print(
-        comparison[
-            ["strategy", "period", "trades", "total_r", "profit_factor", "lcb_mean_r"]
-        ].to_string(index=False)
-    )
+    print(json.dumps({key: value for key, value in report.items() if key != "comparison"}, indent=2))
+    print(comparison[["strategy", "period", "trades", "total_r", "profit_factor", "lcb_mean_r"]].to_string(index=False))
     return 0
 
 

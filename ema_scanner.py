@@ -32,9 +32,13 @@ from flask import Flask, jsonify, request
 # Configuration (override via env vars on Render)
 # ----------------------------------------------------------------------
 
-# Keep credentials out of source control. Configure TRADE_DISCORD_WEBHOOK on the
-# deployment host; DISCORD_WEBHOOK remains an optional status-message fallback.
-TRADE_DISCORD_WEBHOOK = os.getenv("TRADE_DISCORD_WEBHOOK", "").strip()
+# Trade alerts and evaluated-trade reports are pinned to the destination selected
+# for this deployment.  Keeping this separate from the optional status webhook
+# prevents an old DISCORD_WEBHOOK environment value from diverting live trades.
+TRADE_DISCORD_WEBHOOK = (
+    "https://discord.com/api/webhooks/1542626511666937936/"
+    "v8ZhtA5Bo8fo0MC0I_ZWS02wXQQ1AmsQtVoHIxoc_8aWR9lR1Nm0XIgNK-wdV33MGkcZ"
+)
 DISCORD_WEBHOOK = os.getenv("DISCORD_WEBHOOK", TRADE_DISCORD_WEBHOOK).strip()
 RUN_ONCE = os.getenv("RUN_ONCE", "0") == "1"
 
@@ -266,9 +270,7 @@ def _post_discord_chunk(chunk: str, webhook_url: str) -> None:
 
 def send_discord_message(content: str, *, webhook_url: str | None = None):
     """Send one or more webhook posts, splitting oversized Discord messages."""
-    # None means "use the optional status destination"; an explicit empty trade
-    # destination must not fall back and accidentally post trades elsewhere.
-    destination = (DISCORD_WEBHOOK if webhook_url is None else webhook_url).strip()
+    destination = (webhook_url or DISCORD_WEBHOOK or "").strip()
     if not destination:
         logging.warning("No valid webhook URL configured. Alert not sent.")
         return
@@ -278,7 +280,7 @@ def send_discord_message(content: str, *, webhook_url: str | None = None):
 
 
 def send_trade_discord_message(content: str):
-    """Send trade-related output to the configured trade webhook."""
+    """Send trade-related output to the pinned trade webhook."""
     send_discord_message(content, webhook_url=TRADE_DISCORD_WEBHOOK)
 
 

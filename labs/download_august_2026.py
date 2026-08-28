@@ -31,9 +31,9 @@ PERIOD2 = int(dt.datetime(2026, 8, 28, tzinfo=dt.timezone.utc).timestamp())
 def _url(symbol: str, interval: str) -> str:
     query = urllib.parse.urlencode(
         {
-            "period1": PERIOD1
-            if interval == "1d"
-            else int(dt.datetime(2025, 1, 1, tzinfo=dt.timezone.utc).timestamp()),
+            "period1": PERIOD1 if interval == "1d" else int(
+                dt.datetime(2025, 1, 1, tzinfo=dt.timezone.utc).timestamp()
+            ),
             "period2": PERIOD2,
             "interval": interval,
             "events": "history",
@@ -104,9 +104,7 @@ def main() -> int:
         for symbol in symbols
         if scanner.infer_sector_proxy(symbol)
     }
-    downloads = [
-        (symbol, interval) for symbol in sorted(set(symbols) | PROXIES) for interval in ("1d", "1h")
-    ]
+    downloads = [(symbol, interval) for symbol in sorted(set(symbols) | PROXIES) for interval in ("1d", "1h")]
     results: dict[tuple[str, str], dict] = {}
     failures: list[str] = []
     with concurrent.futures.ThreadPoolExecutor(max_workers=6) as pool:
@@ -120,29 +118,14 @@ def main() -> int:
             if number % 100 == 0:
                 print(f"downloaded {number}/{len(downloads)}; failures={len(failures)}", flush=True)
 
-    daily = {
-        symbol: _frame(results[(symbol, "1d")], "1d")
-        for symbol, _ in downloads
-        if (symbol, "1d") in results
-    }
-    hourly = {
-        symbol: _frame(results[(symbol, "1h")], "1h")
-        for symbol, _ in downloads
-        if (symbol, "1h") in results
-    }
-    usable = [
-        symbol
-        for symbol in symbols
-        if not daily.get(symbol, pd.DataFrame()).empty
-        and not hourly.get(symbol, pd.DataFrame()).empty
-    ]
+    daily = {symbol: _frame(results[(symbol, "1d")], "1d") for symbol, _ in downloads if (symbol, "1d") in results}
+    hourly = {symbol: _frame(results[(symbol, "1h")], "1h") for symbol, _ in downloads if (symbol, "1h") in results}
+    usable = [symbol for symbol in symbols if not daily.get(symbol, pd.DataFrame()).empty and not hourly.get(symbol, pd.DataFrame()).empty]
     dataset = bt.MarketDataset(
         symbols=usable,
         daily=daily,
         hourly=hourly,
-        sector_proxies={
-            symbol: proxy for symbol, proxy in sector_proxies.items() if symbol in usable
-        },
+        sector_proxies={symbol: proxy for symbol, proxy in sector_proxies.items() if symbol in usable},
         downloaded_at=dt.datetime.now(dt.timezone.utc).isoformat(),
     )
     cache_path = bt.save_dataset_cache(dataset, CACHE_DIR)
@@ -151,33 +134,14 @@ def main() -> int:
         "usable_stocks": len(usable),
         "missing_stocks": sorted(set(symbols) - set(usable)),
         "required_proxies": sorted(PROXIES),
-        "missing_daily_proxies": sorted(
-            proxy for proxy in PROXIES if daily.get(proxy, pd.DataFrame()).empty
-        ),
-        "missing_hourly_proxies": sorted(
-            proxy for proxy in PROXIES if hourly.get(proxy, pd.DataFrame()).empty
-        ),
+        "missing_daily_proxies": sorted(proxy for proxy in PROXIES if daily.get(proxy, pd.DataFrame()).empty),
+        "missing_hourly_proxies": sorted(proxy for proxy in PROXIES if hourly.get(proxy, pd.DataFrame()).empty),
         "request_failures": failures,
-        "daily_latest": {
-            key: str(value.index.max()) for key, value in daily.items() if not value.empty
-        },
-        "hourly_latest": {
-            key: str(value.index.max()) for key, value in hourly.items() if not value.empty
-        },
+        "daily_latest": {key: str(value.index.max()) for key, value in daily.items() if not value.empty},
+        "hourly_latest": {key: str(value.index.max()) for key, value in hourly.items() if not value.empty},
     }
-    (CACHE_DIR / "coverage.json").write_text(
-        json.dumps(coverage, indent=2, sort_keys=True) + "\n", encoding="utf-8"
-    )
-    print(
-        json.dumps(
-            {
-                key: value
-                for key, value in coverage.items()
-                if key not in {"daily_latest", "hourly_latest"}
-            },
-            indent=2,
-        )
-    )
+    (CACHE_DIR / "coverage.json").write_text(json.dumps(coverage, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    print(json.dumps({key: value for key, value in coverage.items() if key not in {"daily_latest", "hourly_latest"}}, indent=2))
     print(cache_path)
     return 0 if not failures and len(usable) == len(symbols) else 2
 

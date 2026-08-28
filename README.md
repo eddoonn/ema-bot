@@ -42,8 +42,7 @@ computed from the same score version, side, holding period, and 10-point score b
 
 | Variable | Purpose |
 | --- | --- |
-| `TRADE_DISCORD_WEBHOOK` | Required destination for trade alerts and evaluated-trade reports. Configure it as a deployment secret; never commit the webhook URL. |
-| `DISCORD_WEBHOOK` | Optional destination for non-trade status messages. Defaults to `TRADE_DISCORD_WEBHOOK` when omitted. |
+| `DISCORD_WEBHOOK` | Optional destination for non-trade status messages. Trade alerts and evaluated-trade reports use the pinned trade webhook. |
 | `RUN_TOKEN` | Secret required by `POST /run-once`. |
 | `PORT` | Flask port; defaults to `10000`. |
 

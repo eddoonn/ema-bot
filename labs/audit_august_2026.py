@@ -43,16 +43,8 @@ def main() -> int:
             frame = prepared[item.symbol]
             entry_position = item.position + 1
             exit_position = item.position + CONFIG.hold_days
-            entry_date = (
-                bt._date_from_index(frame.index[entry_position])
-                if entry_position < len(frame)
-                else None
-            )
-            exit_date = (
-                bt._date_from_index(frame.index[exit_position])
-                if exit_position < len(frame)
-                else None
-            )
+            entry_date = bt._date_from_index(frame.index[entry_position]) if entry_position < len(frame) else None
+            exit_date = bt._date_from_index(frame.index[exit_position]) if exit_position < len(frame) else None
             selected.append(
                 {
                     "signal_date": signal_date.isoformat(),
@@ -63,9 +55,7 @@ def main() -> int:
                     "adx": item.adx,
                     "entry_date": entry_date.isoformat() if entry_date else None,
                     "scheduled_exit_date": exit_date.isoformat() if exit_date else None,
-                    "status": "matured"
-                    if exit_date and exit_date <= CONFIG.end_date
-                    else "pending",
+                    "status": "matured" if exit_date and exit_date <= CONFIG.end_date else "pending",
                     "avg_dollar_vol_m": item.metadata.get("avg_dollar_vol_m"),
                     "trend4h_slope": item.metadata.get("trend4h_slope"),
                 }
@@ -85,11 +75,9 @@ def main() -> int:
         errors.append("score below threshold")
     if not (trades["adx"] >= CONFIG.adx_hard_min - 1e-12).all():
         errors.append("ADX below hard minimum")
-    if (
-        not trades["avg_dollar_vol_m"]
-        .between(CONFIG.min_dollar_vol_m, CONFIG.max_dollar_vol_m)
-        .all()
-    ):
+    if not trades["avg_dollar_vol_m"].between(
+        CONFIG.min_dollar_vol_m, CONFIG.max_dollar_vol_m
+    ).all():
         errors.append("dollar volume outside configured bounds")
     if not (trades["universe_rank"].between(1, CONFIG.max_alerts_per_day)).all():
         errors.append("rank outside daily cap")
@@ -122,15 +110,8 @@ def main() -> int:
             np.isclose(row.entry_price, expected_entry, rtol=0, atol=1e-9),
             np.isclose(row.exit_price, expected_exit, rtol=0, atol=1e-9),
             np.isclose(row.return_decimal, expected_return, rtol=0, atol=1e-12),
-            np.isclose(
-                row.profit_usd, expected_return * CONFIG.capital_per_trade, rtol=0, atol=1e-9
-            ),
-            np.isclose(
-                row.r_multiple,
-                expected_return * CONFIG.capital_per_trade / one_r,
-                rtol=0,
-                atol=1e-9,
-            ),
+            np.isclose(row.profit_usd, expected_return * CONFIG.capital_per_trade, rtol=0, atol=1e-9),
+            np.isclose(row.r_multiple, expected_return * CONFIG.capital_per_trade / one_r, rtol=0, atol=1e-9),
         ]
         if not all(checks):
             errors.append(f"fill/P&L mismatch: {row.signal_date} {row.symbol} {row.side}")
@@ -183,9 +164,7 @@ def main() -> int:
             "independent aggregate summary",
         ],
     }
-    (OUTPUT_DIR / "audit.json").write_text(
-        json.dumps(audit, indent=2, sort_keys=True) + "\n", encoding="utf-8"
-    )
+    (OUTPUT_DIR / "audit.json").write_text(json.dumps(audit, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     print(json.dumps(audit, indent=2, sort_keys=True))
     return 0 if not errors else 1
 

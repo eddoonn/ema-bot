@@ -62,9 +62,9 @@ def main() -> int:
         for number, future in enumerate(concurrent.futures.as_completed(futures), 1):
             try:
                 symbol, payload = future.result()
-                table = ((payload.get("data") or {}).get("earningsSurpriseTable") or {}).get(
-                    "rows"
-                ) or []
+                table = (
+                    (payload.get("data") or {}).get("earningsSurpriseTable") or {}
+                ).get("rows") or []
                 for record in table:
                     reported = pd.to_datetime(record.get("dateReported"), errors="coerce")
                     if pd.isna(reported):

@@ -37,10 +37,7 @@ def _with_hold(
     hold: int,
 ) -> pd.DataFrame:
     index_maps = {
-        symbol: {
-            bt._date_from_index(value).isoformat(): position
-            for position, value in enumerate(frame.index)
-        }
+        symbol: {bt._date_from_index(value).isoformat(): position for position, value in enumerate(frame.index)}
         for symbol, frame in prepared.items()
     }
     records = []
@@ -115,9 +112,7 @@ def main() -> int:
         held = _with_hold(raw, prepared, hold)
         for period, bounds in PERIODS.items():
             trades = apply_variant(held, RECOMMENDED, *bounds)
-            hold_rows.append(
-                {"hold_sessions": hold, **_summary_row("liquidity_filter", period, trades)}
-            )
+            hold_rows.append({"hold_sessions": hold, **_summary_row("liquidity_filter", period, trades)})
     pd.DataFrame(hold_rows).to_csv(OUTPUT_DIR / "hold_period_sweep.csv", index=False)
 
     recommended_all = apply_variant(recommended_ledger, RECOMMENDED, START, END)
@@ -139,14 +134,11 @@ def main() -> int:
     for row in recommended_all.itertuples(index=False):
         frame = prepared[row.symbol]
         date_map = {
-            bt._date_from_index(value).isoformat(): position
-            for position, value in enumerate(frame.index)
+            bt._date_from_index(value).isoformat(): position for position, value in enumerate(frame.index)
         }
         position = date_map[row.signal_date]
         expected_entry_date = bt._date_from_index(frame.index[position + 1]).isoformat()
-        expected_exit_date = bt._date_from_index(
-            frame.index[position + RECOMMENDED_HOLD]
-        ).isoformat()
+        expected_exit_date = bt._date_from_index(frame.index[position + RECOMMENDED_HOLD]).isoformat()
         expected_entry = float(frame["Open"].iloc[position + 1])
         expected_exit = float(frame["Close"].iloc[position + RECOMMENDED_HOLD])
         direction = 1.0 if row.side == "BUY" else -1.0

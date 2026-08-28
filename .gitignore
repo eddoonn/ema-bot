@@ -1,6 +1,7 @@
 __pycache__/
 *.py[cod]
 .pytest_cache/
+pytest-of-root/
 .ruff_cache/
 .coverage
 htmlcov/
@@ -9,3 +10,7 @@ htmlcov/
 trades_log.csv
 signal_results.csv
 *.csv.tmp
+labs/cache/*
+!labs/cache/.gitkeep
+labs/results/
+backtest_*_results/

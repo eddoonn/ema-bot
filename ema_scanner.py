@@ -32,7 +32,14 @@ from flask import Flask, jsonify, request
 # Configuration (override via env vars on Render)
 # ----------------------------------------------------------------------
 
-DISCORD_WEBHOOK = os.getenv("DISCORD_WEBHOOK")
+# Trade alerts and evaluated-trade reports are pinned to the destination selected
+# for this deployment.  Keeping this separate from the optional status webhook
+# prevents an old DISCORD_WEBHOOK environment value from diverting live trades.
+TRADE_DISCORD_WEBHOOK = (
+    "https://discord.com/api/webhooks/1542626511666937936/"
+    "v8ZhtA5Bo8fo0MC0I_ZWS02wXQQ1AmsQtVoHIxoc_8aWR9lR1Nm0XIgNK-wdV33MGkcZ"
+)
+DISCORD_WEBHOOK = os.getenv("DISCORD_WEBHOOK", TRADE_DISCORD_WEBHOOK).strip()
 RUN_ONCE = os.getenv("RUN_ONCE", "0") == "1"
 
 EMA_FAST = int(os.getenv("EMA_FAST", 13))
@@ -48,16 +55,16 @@ RESAMPLE_4H_OFFSET = os.getenv("RESAMPLE_4H_OFFSET", "9h30min")
 TREND_PERIOD = os.getenv("TREND_PERIOD", "180d")
 
 CHECK_INTERVAL = int(os.getenv("CHECK_INTERVAL", 120))
-HOLD_DAYS = int(os.getenv("HOLD_DAYS", 5))
+HOLD_DAYS = int(os.getenv("HOLD_DAYS", 7))
 CAPITAL_PER_TRADE = float(os.getenv("CAPITAL_PER_TRADE", 500))
 LOG_FILE = os.getenv("LOG_FILE", "trades_log.csv")
 RESULTS_LOG_FILE = os.getenv("RESULTS_LOG_FILE", "signal_results.csv")
 CALIBRATION_MIN_SAMPLES = int(os.getenv("CALIBRATION_MIN_SAMPLES", 20))
-RANK_SCORE_VERSION = os.getenv("RANK_SCORE_VERSION", "v3").strip() or "v3"
+RANK_SCORE_VERSION = os.getenv("RANK_SCORE_VERSION", "v4").strip() or "v4"
 
 # Eligibility and ranking inputs
 ADX_MIN = float(os.getenv("ADX_MIN", 17))
-ADX_HARD_MIN = float(os.getenv("ADX_HARD_MIN", 17))
+ADX_HARD_MIN = float(os.getenv("ADX_HARD_MIN", 18))
 TREND_BUF = float(os.getenv("TREND_BUF", 0.995))
 USE_OBV = os.getenv("USE_OBV", "0") == "1"
 
@@ -88,22 +95,23 @@ YF_BATCH_CHUNK = int(os.getenv("YF_BATCH_CHUNK", 40))
 PROXY_CACHE_MINUTES = int(os.getenv("PROXY_CACHE_MINUTES", 15))
 BACKTEST_PERIOD = os.getenv("BACKTEST_PERIOD", "1y")
 MAX_ALERTS_PER_CYCLE = int(os.getenv("MAX_ALERTS_PER_CYCLE", 10))
-MIN_RANK_SCORE = float(os.getenv("MIN_RANK_SCORE", 0.40))
+MIN_TRADE_SCORE = 0.40
+# A stale deployment value may make the scanner stricter, but it cannot undo the
+# final decision to suppress every live trade below 0.40.
+MIN_RANK_SCORE = max(MIN_TRADE_SCORE, float(os.getenv("MIN_RANK_SCORE", MIN_TRADE_SCORE)))
 DAILY_BAR_CLOSE_BUFFER_MINUTES = int(os.getenv("DAILY_BAR_CLOSE_BUFFER_MINUTES", 15))
 
 # Precision-mode controls
 MARKET_PROXY = os.getenv("MARKET_PROXY", "SPY")
-MIN_DOLLAR_VOL_M = float(os.getenv("MIN_DOLLAR_VOL_M", 25))
-MAX_DOLLAR_VOL_M = float(
-    os.getenv("MAX_DOLLAR_VOL_M", 0)
-)  # 0 = no upper bound; set 1000 to cut mega-cap churn
+MIN_DOLLAR_VOL_M = float(os.getenv("MIN_DOLLAR_VOL_M", 100))
+MAX_DOLLAR_VOL_M = float(os.getenv("MAX_DOLLAR_VOL_M", 750))
 EXTRA_TICKERS = os.getenv("EXTRA_TICKERS", "")
 PULLBACK_LOOKBACK = int(os.getenv("PULLBACK_LOOKBACK", 3))
 PULLBACK_TOUCH_PCT = float(os.getenv("PULLBACK_TOUCH_PCT", 0.006))
 CLOSE_IN_RANGE_MIN = float(os.getenv("CLOSE_IN_RANGE_MIN", 0.60))
 TREND_ESTABLISHED_BARS = int(os.getenv("TREND_ESTABLISHED_BARS", 3))
 FOURH_SLOPE_BARS = int(os.getenv("FOURH_SLOPE_BARS", 5))
-FOURH_SLOPE_MIN = float(os.getenv("FOURH_SLOPE_MIN", 0.002))
+FOURH_SLOPE_MIN = float(os.getenv("FOURH_SLOPE_MIN", 0.003))
 FOURH_MAX_STRETCH_ATR = float(os.getenv("FOURH_MAX_STRETCH_ATR", 4.5))
 
 USE_MARKET_REGIME_SCORE = (
@@ -137,7 +145,10 @@ RS_EMA = int(os.getenv("RS_EMA", 20))
 ENABLE_EVENT_FILTER = os.getenv("ENABLE_EVENT_FILTER", "1") == "1"
 ENABLE_EARNINGS_FILTER = os.getenv("ENABLE_EARNINGS_FILTER", "1") == "1"
 EARNINGS_SKIP_DAYS_BEFORE = int(os.getenv("EARNINGS_SKIP_DAYS_BEFORE", 3))
-EARNINGS_SKIP_DAYS_AFTER = int(os.getenv("EARNINGS_SKIP_DAYS_AFTER", 2))
+# Block the report date and the configured lead-in, but allow a new setup from
+# the next session onward. Historical walk-forward tests found that suppressing
+# the first two post-report sessions removed useful price-discovery setups.
+EARNINGS_SKIP_DAYS_AFTER = int(os.getenv("EARNINGS_SKIP_DAYS_AFTER", 0))
 GAP_ATR_MAX = float(os.getenv("GAP_ATR_MAX", 1.20))
 ALLOW_BIOTECH_WITHOUT_INSIDERS = os.getenv("ALLOW_BIOTECH_WITHOUT_INSIDERS", "0") == "1"
 BIOTECH_WHITELIST = {
@@ -246,9 +257,9 @@ def _split_discord_message(content: str, limit: int = 2_000) -> list[str]:
     return chunks
 
 
-def _post_discord_chunk(chunk: str) -> None:
+def _post_discord_chunk(chunk: str, webhook_url: str) -> None:
     try:
-        resp = requests.post(DISCORD_WEBHOOK, json={"content": chunk}, timeout=10)
+        resp = requests.post(webhook_url, json={"content": chunk}, timeout=10)
         if resp.status_code >= 300:
             logging.error(f"Discord send failed: {resp.status_code} {resp.text}")
         else:
@@ -257,14 +268,20 @@ def _post_discord_chunk(chunk: str) -> None:
         logging.error(f"Discord send failed: {exc}")
 
 
-def send_discord_message(content: str):
+def send_discord_message(content: str, *, webhook_url: str | None = None):
     """Send one or more webhook posts, splitting oversized Discord messages."""
-    if not DISCORD_WEBHOOK:
+    destination = (webhook_url or DISCORD_WEBHOOK or "").strip()
+    if not destination:
         logging.warning("No valid webhook URL configured. Alert not sent.")
         return
 
     for chunk in _split_discord_message(content):
-        _post_discord_chunk(chunk)
+        _post_discord_chunk(chunk, destination)
+
+
+def send_trade_discord_message(content: str):
+    """Send trade-related output to the pinned trade webhook."""
+    send_discord_message(content, webhook_url=TRADE_DISCORD_WEBHOOK)
 
 
 def to_float(x):
@@ -409,14 +426,14 @@ def validate_config() -> None:
         errors.append("CLOSE_IN_RANGE_MIN must be between 0 and 1")
     if not 0 <= MIN_RANK_SCORE <= 1:
         errors.append("MIN_RANK_SCORE must be between 0 and 1")
-    if min(MIN_DOLLAR_VOL_M, FOURH_MAX_STRETCH_ATR) < 0:
-        errors.append("volume and stretch settings cannot be negative")
-    if MAX_DOLLAR_VOL_M < 0:
-        errors.append("MAX_DOLLAR_VOL_M cannot be negative")
-    if ADX_HARD_MIN <= 0:
-        errors.append("ADX_HARD_MIN must be > 0")
-    if FOURH_SLOPE_MIN < 0:
-        errors.append("FOURH_SLOPE_MIN cannot be negative")
+    if not 0 <= ADX_MIN <= 100 or not 0 <= ADX_HARD_MIN <= 100:
+        errors.append("ADX_MIN and ADX_HARD_MIN must be between 0 and 100")
+    if min(MIN_DOLLAR_VOL_M, MAX_DOLLAR_VOL_M) < 0:
+        errors.append("dollar-volume settings cannot be negative")
+    if 0 < MAX_DOLLAR_VOL_M < MIN_DOLLAR_VOL_M:
+        errors.append("MAX_DOLLAR_VOL_M must be 0 (disabled) or >= MIN_DOLLAR_VOL_M")
+    if FOURH_SLOPE_MIN < 0 or FOURH_MAX_STRETCH_ATR < 0:
+        errors.append("4H slope and stretch settings cannot be negative")
     if TREND_BUF <= 0:
         errors.append("TREND_BUF must be > 0")
     if MAX_RETRIES < 0 or BACKOFF_JITTER_MAX < 0:
@@ -1425,6 +1442,8 @@ def _compute_signal_for_df(
 
     if any(pd.isna(v) for v in [close, adx, atr]):
         return None
+    if adx < ADX_HARD_MIN:
+        return None
     if len(macd_hist) < (MACD_ACCEL_BARS + 2) or len(df_daily) <= SLOPE_W:
         return None
 
@@ -1439,15 +1458,8 @@ def _compute_signal_for_df(
     adx_rising = adx > adx_prev and adx > ADX_MIN
 
     avg_dollar_vol = to_float(df_daily["avg_dollar_vol_20"].iloc[-1])
-    liquid_ok = avg_dollar_vol >= MIN_DOLLAR_VOL_M
-    if MAX_DOLLAR_VOL_M > 0 and avg_dollar_vol > MAX_DOLLAR_VOL_M:
-        liquid_ok = False
-    # Hard ADX floor: previously ADX was only a ranking vote, allowing weak-trend
-    # trades (ADX <15) that dominate the -441 PnL / 19.2% large-loss bucket.
-    # Enforce a hard eligibility gate here; tuned to 18 from 22 via 2026 sweep
-    # (ADX 22-30: +617, 15-22: +133, <15: -441).
-    if not np.isfinite(adx) or adx < ADX_HARD_MIN:
-        return None
+    below_volume_cap = MAX_DOLLAR_VOL_M == 0 or avg_dollar_vol <= MAX_DOLLAR_VOL_M
+    liquid_ok = avg_dollar_vol >= MIN_DOLLAR_VOL_M and below_volume_cap
 
     def _macd_accel_ok(long_side: bool):
         n = MACD_ACCEL_BARS
@@ -1780,7 +1792,7 @@ def _scan_symbol(
         meta["openinsider_recent_buy_value"] = insider_ctx.get("recent_buy_value", 0.0)
 
     if rank_score < MIN_RANK_SCORE:
-        logging.info(f"Skipping {sym} below optional rank floor ({rank_score:.3f})")
+        logging.info(f"Skipping {sym} below rank floor ({rank_score:.3f})")
         return None
 
     insider_note = ""
@@ -1919,6 +1931,15 @@ def _finalize_ranked_candidates(
     for candidate in ranked:
         if len(alerts) >= MAX_ALERTS_PER_CYCLE:
             break
+        # Enforce the floor again at the final delivery boundary. This keeps a
+        # directly constructed or long-lived in-memory candidate below 0.40 from
+        # being persisted or sent even if it bypassed `_scan_symbol`.
+        if candidate.score < MIN_RANK_SCORE:
+            logging.info(
+                f"Skipping {candidate.symbol} below rank floor at delivery "
+                f"({candidate.score:.3f} < {MIN_RANK_SCORE:.3f})"
+            )
+            continue
         if not _next_open_entry_is_pending(candidate.signal_date, now=now):
             logging.info(
                 f"Skipping stale {candidate.side} candidate for {candidate.symbol}: "
@@ -2281,8 +2302,14 @@ def evaluate_old_signals():
     msg = "**Weekly Performance Report (next-open entries)**\n"
     for sym, side, entry, exitp, prof, score, setup in results:
         emoji = "WIN" if prof > 0 else "LOSS"
-        msg += f"{emoji} {sym} {side} {entry:.2f} -> {exitp:.2f} | {prof:+.2f} USD | Score {score:.3f} | {setup}\n"
-    msg += f"\nTotal: {total:+.2f} USD | Winrate: {winrate:.1f}% | Avg: {avg_trade:+.2f} USD/trade | AvgScore: {average_score:.3f}"
+        msg += (
+            f"{emoji} {sym} {side} {entry:.2f} -> {exitp:.2f} | "
+            f"{prof:+.2f} USD | Score {score:.3f} | {setup}\n"
+        )
+    msg += (
+        f"\nTotal: {total:+.2f} USD | Winrate: {winrate:.1f}% | "
+        f"Avg: {avg_trade:+.2f} USD/trade | AvgScore: {average_score:.3f}"
+    )
     if not results_history.empty:
         msg += f" | Historical outcomes: {len(results_history)}"
 
@@ -2343,14 +2370,14 @@ def _send_ranked_alerts(candidates: list[SignalCandidate]) -> int:
 
     now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M")
     message = f"**EMA Ranked Alerts ({now})**\n" + "\n".join(alerts)
-    send_discord_message(message)
+    send_trade_discord_message(message)
     return len(alerts)
 
 
 def _send_performance_report():
     report = evaluate_old_signals()
     if report:
-        send_discord_message(report)
+        send_trade_discord_message(report)
 
 
 def run_one_full_pass(*, lock_already_acquired=False):

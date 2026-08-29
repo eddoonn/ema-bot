@@ -1,0 +1,37 @@
+name: 2-Hour EMA Scan (Market Hours)
+
+on:
+  schedule:
+    # 14:00, 16:00, 18:00, 20:00 UTC (9:30, 11:30, 13:30, 15:30 ET) Mon-Fri
+    - cron: "0 14,16,18,20 * * 1-5"
+  workflow_dispatch:
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+      - run: pip install -r requirements.txt -r requirements-dev.txt
+      - env:
+          DISCORD_WEBHOOK: ${{ secrets.DISCORD_WEBHOOK }}
+          LSE_API_KEY: ${{ secrets.LSE_API_KEY }}
+          USE_LSE_DATA: "1"
+          RUN_ONCE: "1"
+          CHECK_INTERVAL: "1"
+          SCAN_BATCH_SIZE: "125"
+          MAX_ALERTS_PER_CYCLE: "10"
+          LSE_DAILY_LOOKBACK_DAYS: "500"
+          LSE_HOURLY_LOOKBACK_DAYS: "730"
+        run: |
+          python -c "
+import os
+os.environ['RUN_ONCE'] = '1'
+os.environ['CHECK_INTERVAL'] = '1'
+from ema_scanner import main
+main()
+"

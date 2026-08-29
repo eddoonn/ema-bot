@@ -22,6 +22,7 @@ import pandas as pd
 
 try:
     from lse import LSE, LSEError
+
     LSE_AVAILABLE = True
 except Exception:
     LSE_AVAILABLE = False
@@ -118,19 +119,25 @@ def get_candles(
 
 
 @lru_cache(maxsize=32)
-def get_daily_candles(symbol: str, start: str | None = None, end: str | None = None, limit: int = 0) -> pd.DataFrame:
+def get_daily_candles(
+    symbol: str, start: str | None = None, end: str | None = None, limit: int = 0
+) -> pd.DataFrame:
     """Convenience: daily candles (1d) — cached."""
     return get_candles(symbol, "1d", start, end, limit)
 
 
 @lru_cache(maxsize=32)
-def get_hourly_candles(symbol: str, start: str | None = None, end: str | None = None, limit: int = 0) -> pd.DataFrame:
+def get_hourly_candles(
+    symbol: str, start: str | None = None, end: str | None = None, limit: int = 0
+) -> pd.DataFrame:
     """Convenience: hourly candles (1h) — cached."""
     return get_candles(symbol, "1h", start, end, limit)
 
 
 @lru_cache(maxsize=32)
-def get_4h_candles(symbol: str, start: str | None = None, end: str | None = None, limit: int = 0) -> pd.DataFrame:
+def get_4h_candles(
+    symbol: str, start: str | None = None, end: str | None = None, limit: int = 0
+) -> pd.DataFrame:
     """Convenience: 4-hour candles (4h) — cached."""
     return get_candles(symbol, "4h", start, end, limit)
 
@@ -328,7 +335,6 @@ def get_lse_earnings_date(
     """Get nearest earnings date from LSE economic calendar."""
     if not is_available():
         return None
-    client = _get_client()
     try:
         today = datetime.date.today()
         start = (today - datetime.timedelta(days=days_behind)).isoformat()
@@ -393,9 +399,15 @@ def get_lse_macro_regime() -> dict:
     if not is_available():
         return {"us10y": pd.DataFrame(), "cpi": pd.DataFrame(), "ffr": pd.DataFrame()}
     return {
-        "us10y": get_bond_yields("US10Y", start=(datetime.date.today() - datetime.timedelta(days=730)).isoformat()),
-        "cpi": get_economic_series("cpi_yoy", start=(datetime.date.today() - datetime.timedelta(days=730)).isoformat()),
-        "ffr": get_macro_series("fdtr", start=(datetime.date.today() - datetime.timedelta(days=730)).isoformat()),
+        "us10y": get_bond_yields(
+            "US10Y", start=(datetime.date.today() - datetime.timedelta(days=730)).isoformat()
+        ),
+        "cpi": get_economic_series(
+            "cpi_yoy", start=(datetime.date.today() - datetime.timedelta(days=730)).isoformat()
+        ),
+        "ffr": get_macro_series(
+            "fdtr", start=(datetime.date.today() - datetime.timedelta(days=730)).isoformat()
+        ),
     }
 
 
@@ -414,8 +426,20 @@ def build_lse_market_regime(spy_df: pd.DataFrame, macro: dict | None = None) -> 
         close = float(spy_df["Close"].iloc[-1])
         ema50 = float(spy_df["Close"].ewm(span=50, adjust=False).mean().iloc[-1])
         ema200 = float(spy_df["Close"].ewm(span=200, adjust=False).mean().iloc[-1])
-        slope50 = (ema50 / float(spy_df["Close"].ewm(span=50, adjust=False).mean().iloc[-6]) - 1.0) if len(spy_df) > 6 else 0.0
-        slope200 = (float(spy_df["Close"].ewm(span=200, adjust=False).mean().iloc[-1]) / float(spy_df["Close"].ewm(span=200, adjust=False).mean().iloc[-21]) - 1.0) if len(spy_df) > 21 else 0.0
+        slope50 = (
+            (ema50 / float(spy_df["Close"].ewm(span=50, adjust=False).mean().iloc[-6]) - 1.0)
+            if len(spy_df) > 6
+            else 0.0
+        )
+        slope200 = (
+            (
+                float(spy_df["Close"].ewm(span=200, adjust=False).mean().iloc[-1])
+                / float(spy_df["Close"].ewm(span=200, adjust=False).mean().iloc[-21])
+                - 1.0
+            )
+            if len(spy_df) > 21
+            else 0.0
+        )
 
         # Add macro confirmation if available
         macro_score = 0.0
@@ -451,25 +475,25 @@ def build_lse_market_regime(spy_df: pd.DataFrame, macro: dict | None = None) -> 
 
 
 __all__ = [
-    "is_available",
-    "get_candles",
-    "get_daily_candles",
-    "get_hourly_candles",
+    "build_lse_market_regime",
     "get_4h_candles",
-    "get_economic_calendar",
-    "get_insider_trades",
-    "get_fundamentals",
-    "get_financial_reports",
-    "get_company_profile",
     "get_bond_yields",
-    "get_macro_series",
-    "get_economic_series",
+    "get_candles",
     "get_catalog",
+    "get_company_profile",
+    "get_daily_candles",
+    "get_economic_calendar",
+    "get_economic_series",
+    "get_financial_reports",
+    "get_fundamentals",
+    "get_hourly_candles",
+    "get_insider_trades",
+    "get_lse_earnings_date",
+    "get_lse_earnings_dates",
+    "get_lse_insider_signal",
+    "get_lse_macro_regime",
+    "get_macro_series",
+    "is_available",
     "prepare_lse_daily_df",
     "prepare_lse_hourly_df",
-    "get_lse_earnings_date",
-    "get_lse_insider_signal",
-    "get_lse_earnings_dates",
-    "get_lse_macro_regime",
-    "build_lse_market_regime",
 ]

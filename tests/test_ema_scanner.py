@@ -774,6 +774,7 @@ def test_trade_messages_use_pinned_webhook(monkeypatch):
 
     monkeypatch.setattr(scanner.requests, "post", fake_post)
     monkeypatch.setattr(scanner, "DISCORD_WEBHOOK", "https://example.invalid/old-status-hook")
+    monkeypatch.setattr(scanner, "TRADE_DISCORD_WEBHOOK", "https://example.invalid/trade-hook")
 
     scanner.send_trade_discord_message("trade")
 

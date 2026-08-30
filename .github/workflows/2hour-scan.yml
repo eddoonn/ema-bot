@@ -6,6 +6,9 @@ on:
     - cron: "0 14,16,18,20 * * 1-5"
   workflow_dispatch:
 
+permissions:
+  contents: read
+
 jobs:
   scan:
     runs-on: ubuntu-latest
